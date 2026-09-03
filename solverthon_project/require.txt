@@ -1,6 +1,0 @@
-openai
-google-generativeai
-streamlit
-pandas
-opencv-python
-pyzbar
