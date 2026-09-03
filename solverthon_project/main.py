@@ -6,37 +6,60 @@ from hashlib import sha1, sha256
 from html import escape
 from pathlib import Path
 import re
+from textwrap import dedent
 from typing import Any
 from urllib.parse import quote_plus
 
 import pandas as pd
 import streamlit as st
 
+from ai_client import (
+    generate_gemini_routes,
+    get_gemini_status,
+)
+
 
 # -----------------------------------------------------------------------------
-# 앱 설정
+# 앱 기본 설정
 # -----------------------------------------------------------------------------
 APP_NAME = "WAITGO"
 APP_SUBTITLE = "광주·전남 대기여행"
-BUILD = "V3.3 MOBILE"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "data" / "places.csv"
-REQUIRED_COLUMNS = ("카테고리", "이름", "주소")
+
+REQUIRED_COLUMNS = (
+    "카테고리",
+    "이름",
+    "주소",
+)
 
 HOME = "🏠 홈"
 COURSE = "🧭 코스"
 CHECKIN = "📷 체크인"
 MY = "👤 MY"
 
-NAV_ITEMS = (HOME, COURSE, CHECKIN, MY)
-NAV_KEY = "bottom_nav"
+NAV_ITEMS = (
+    HOME,
+    COURSE,
+    CHECKIN,
+    MY,
+)
+
+NAV_KEY = "app_nav"
 
 CATEGORY_ICON = {
     "맛집": "🍽️",
     "관광명소": "🌿",
     "문화공간": "🎨",
     "카페": "☕",
+}
+
+CATEGORY_CLASS = {
+    "맛집": "food",
+    "관광명소": "nature",
+    "문화공간": "culture",
+    "카페": "cafe",
 }
 
 DEFAULT_DURATION = {
@@ -53,31 +76,38 @@ INTEREST_CATEGORY = {
     "로컬 감성": "관광명소",
 }
 
-ROUTE_TYPES = (
+FALLBACK_ROUTES = (
     (
-        "가볍게 한바퀴",
-        "산책형",
-        "짧고 부담 없이 둘러보는 코스",
-        ("관광명소", "카페", "문화공간"),
+        "가볍게 쉬어가는 코스",
+        "여유형",
+        (
+            "대기 전후로 부담 없이 "
+            "머물 수 있는 장소를 담았어요."
+        ),
     ),
     (
-        "내 취향 중심",
-        "맞춤형",
-        "선택한 관심사를 먼저 반영한 코스",
-        ("카페", "문화공간", "관광명소"),
+        "취향을 따라가는 코스",
+        "취향형",
+        (
+            "선택한 관심사를 중심으로 "
+            "지역의 매력을 골랐어요."
+        ),
     ),
     (
-        "실내·휴식 균형",
-        "안심형",
-        "문화공간과 카페를 중심으로 쉬어가는 코스",
-        ("문화공간", "카페", "관광명소"),
+        "식사 뒤까지 이어지는 코스",
+        "균형형",
+        (
+            "대기시간부터 식사 후 일정까지 "
+            "자연스럽게 이어져요."
+        ),
     ),
 )
 
-
-# Streamlit 명령 중 가장 먼저 실행
 st.set_page_config(
-    page_title=f"{APP_NAME} · {BUILD}",
+    page_title=(
+        f"{APP_NAME} · "
+        f"{APP_SUBTITLE}"
+    ),
     page_icon="🧭",
     layout="centered",
     initial_sidebar_state="collapsed",
@@ -85,17 +115,54 @@ st.set_page_config(
 
 
 # -----------------------------------------------------------------------------
-# 공통 함수
+# 공통 도우미
 # -----------------------------------------------------------------------------
+def ui(markup: str) -> None:
+    """
+    순수 HTML/CSS는 st.html로 렌더링한다.
+
+    구버전 Streamlit에서는
+    들여쓰기를 제거한 st.markdown으로 대체한다.
+    """
+    body = dedent(markup).strip()
+
+    if hasattr(st, "html"):
+        st.html(body)
+
+    else:
+        st.markdown(
+            body,
+            unsafe_allow_html=True,
+        )
+
+
 def h(value: Any) -> str:
-    """HTML에 넣을 문자열을 안전하게 변환한다."""
-    return escape(str(value or "").strip())
+    """
+    동적 텍스트를 HTML에서 안전하게 사용한다.
+    """
+    return escape(
+        str(value or "").strip()
+    )
 
 
-def stable_number(text: str, modulo: int) -> int:
-    """같은 입력은 항상 같은 숫자가 나오도록 해시를 만든다."""
-    digest = sha256(text.encode("utf-8")).hexdigest()
-    return int(digest[:14], 16) % modulo
+def short_address(
+    address: str,
+) -> str:
+    """
+    카드에서는 주소를 조금 짧게 표시한다.
+    """
+    return (
+        str(address or "")
+        .replace(
+            "전라남도",
+            "전남",
+        )
+        .replace(
+            "광주광역시",
+            "광주",
+        )
+        .strip()
+    )
 
 
 def optional_text(
@@ -103,125 +170,196 @@ def optional_text(
     *columns: str,
 ) -> str:
     """
-    CSV에 선택 컬럼이 추가될 경우 활용한다.
-
-    예:
-    체류시간, 설명, 대표메뉴, 태그
+    CSV에 선택 컬럼을 추가했을 때
+    자동으로 활용한다.
     """
     for column in columns:
-        value = row.get(column, "")
+        value = row.get(
+            column,
+            "",
+        )
 
-        if value is not None and str(value).strip():
+        if (
+            value is not None
+            and str(value).strip()
+        ):
             return str(value).strip()
 
     return ""
 
 
-def parse_minutes(value: Any, default: int) -> int:
+def parse_minutes(
+    value: Any,
+    default: int,
+) -> int:
     """
-    '30분', '약 40분', '35' 같은 값을 분 단위 숫자로 변환한다.
+    '30분', '약 40분', '35' 등을
+    분 단위 숫자로 바꾼다.
     """
-    match = re.search(r"\d+", str(value or ""))
+    match = re.search(
+        r"\d+",
+        str(value or ""),
+    )
 
     if not match:
         return default
 
-    return max(10, min(180, int(match.group())))
+    return max(
+        10,
+        min(
+            180,
+            int(match.group()),
+        ),
+    )
 
 
-def format_minutes(minutes: int) -> str:
-    """분을 1시간 30분 형식으로 표시한다."""
-    hours, remain = divmod(max(0, int(minutes)), 60)
+def format_minutes(
+    value: int,
+) -> str:
+    """
+    분을 1시간 30분 형태로 표시한다.
+    """
+    hours, minutes = divmod(
+        max(0, int(value)),
+        60,
+    )
 
-    if hours and remain:
-        return f"{hours}시간 {remain}분"
+    if hours and minutes:
+        return (
+            f"{hours}시간 "
+            f"{minutes}분"
+        )
 
     if hours:
         return f"{hours}시간"
 
-    return f"{remain}분"
+    return f"{minutes}분"
 
 
-def extract_region(address: str) -> str:
+def stable_number(
+    text: str,
+    modulo: int,
+) -> int:
     """
-    주소에서 광주 구 또는 전남 시·군을 추출한다.
-
-    CSV에 '지역' 컬럼이 추가되면 CSV의 지역값을 우선 사용한다.
+    같은 문자열에서 항상 같은
+    시연용 숫자를 만든다.
     """
-    address = re.sub(r"\s+", " ", str(address).strip())
-    tokens = address.split(" ")
+    digest = sha256(
+        text.encode("utf-8")
+    ).hexdigest()
 
-    if address.startswith("광주광역시"):
-        district = next(
-            (
-                token
-                for token in tokens[1:]
-                if token.endswith(("구", "군"))
-            ),
-            "",
+    return (
+        int(
+            digest[:14],
+            16,
         )
+        % modulo
+    )
 
-        return f"광주 {district}".strip() if district else "광주"
 
-    # 현재 CSV에 들어 있는 광주 주소 표기도 대응
-    if address.startswith(("전남광주", "광주 ")):
+def extract_region(
+    address: str,
+) -> str:
+    """
+    주소에서 광주 구 또는
+    전남 시·군을 추출한다.
+    """
+    address = re.sub(
+        r"\s+",
+        " ",
+        str(address).strip(),
+    )
+
+    tokens = address.split()
+
+    if address.startswith(
+        (
+            "광주광역시",
+            "전남광주",
+            "광주 ",
+        )
+    ):
         district = next(
             (
                 token
                 for token in tokens
-                if token.endswith(("구", "군"))
+                if token.endswith(
+                    (
+                        "구",
+                        "군",
+                    )
+                )
             ),
             "",
         )
 
-        return f"광주 {district}".strip() if district else "광주"
+        if district:
+            return f"광주 {district}"
 
-    if address.startswith(("전라남도", "전남 ")):
-        city = next(
+        return "광주"
+
+    if address.startswith(
+        (
+            "전라남도",
+            "전남 ",
+        )
+    ):
+        return next(
             (
                 token
                 for token in tokens[1:]
-                if token.endswith(("시", "군"))
+                if token.endswith(
+                    (
+                        "시",
+                        "군",
+                    )
+                )
             ),
-            "",
+            "전남",
         )
-
-        return city or "전남"
 
     return "지역 확인 필요"
 
 
-def reason_for(
+def default_reason(
     category: str,
     companion: str,
-    custom: str = "",
 ) -> str:
-    """CSV 설명이 없을 때 기본 추천 이유를 만든다."""
-    if custom:
-        return custom
-
+    """
+    Gemini 실패 시 사용할 기본 추천 이유.
+    """
     prefix = {
-        "혼자": "혼자서도 부담 없이",
-        "연인": "함께 분위기와 사진을 즐기며",
-        "가족": "가족과 편안하게",
+        "혼자": "혼자서도 편안하게",
+        "연인": "함께 분위기를 즐기며",
+        "가족": "가족과 여유롭게",
         "친구": "친구와 가볍게",
-    }.get(companion, "편안하게")
-
-    reasons = {
-        "관광명소": f"{prefix} 둘러보기 좋은 지역 명소",
-        "문화공간": f"{prefix} 머물기 좋은 문화 공간",
-        "카페": f"{prefix} 쉬어가기 좋은 카페",
-        "맛집": "대기 종료 후 이어지는 선택 맛집",
-    }
-
-    return reasons.get(
-        category,
-        f"{prefix} 방문하기 좋은 장소",
+    }.get(
+        companion,
+        "여유롭게",
     )
+
+    ending = {
+        "관광명소": (
+            "둘러보기 좋은 지역 명소예요."
+        ),
+        "문화공간": (
+            "새로운 이야기를 만나기 좋은 공간이에요."
+        ),
+        "카페": (
+            "잠시 쉬어가기 좋은 카페예요."
+        ),
+    }.get(
+        category,
+        "방문하기 좋은 장소예요.",
+    )
+
+    return f"{prefix} {ending}"
 
 
 def go(page: str) -> None:
-    """하단 메뉴를 변경하고 화면을 즉시 다시 실행한다."""
+    """
+    하단 메뉴를 변경하고 즉시 다시 실행한다.
+    """
     st.session_state[NAV_KEY] = page
     st.rerun()
 
@@ -237,19 +375,25 @@ def load_places(
     """
     data/places.csv를 읽는다.
 
-    modified_time을 인자로 받아 CSV 수정 후 자동으로 캐시가 갱신되게 한다.
+    modified_time을 이용해
+    CSV 수정 후 캐시가 자동 갱신되게 한다.
     """
     del modified_time
 
     last_error: Exception | None = None
 
-    for encoding in ("utf-8-sig", "utf-8", "cp949"):
+    for encoding in (
+        "utf-8-sig",
+        "utf-8",
+        "cp949",
+    ):
         try:
             df = pd.read_csv(
                 path,
                 encoding=encoding,
                 dtype=str,
             )
+
             break
 
         except UnicodeDecodeError as exc:
@@ -257,11 +401,17 @@ def load_places(
 
     else:
         raise ValueError(
-            "CSV를 UTF-8 또는 CP949 형식으로 저장해 주세요."
+            "CSV를 UTF-8 또는 "
+            "CP949 형식으로 저장해 주세요."
         ) from last_error
 
     df.columns = [
-        str(column).replace("\ufeff", "").strip()
+        str(column)
+        .replace(
+            "\ufeff",
+            "",
+        )
+        .strip()
         for column in df.columns
     ]
 
@@ -273,7 +423,8 @@ def load_places(
 
     if missing:
         raise ValueError(
-            f"필수 컬럼이 없습니다: {', '.join(missing)}"
+            "필수 컬럼이 없습니다: "
+            + ", ".join(missing)
         )
 
     for column in df.columns:
@@ -284,20 +435,29 @@ def load_places(
             .str.strip()
         )
 
-    df = df[
-        (df["이름"] != "")
-        & (df["주소"] != "")
-    ].copy()
+    df = (
+        df[
+            (df["이름"] != "")
+            & (df["주소"] != "")
+        ]
+        .drop_duplicates()
+        .copy()
+    )
 
-    df = df.drop_duplicates().copy()
-
-    derived_region = df["주소"].map(extract_region)
+    derived_region = (
+        df["주소"]
+        .map(extract_region)
+    )
 
     if "지역" in df.columns:
-        df["지역"] = df["지역"].where(
-            df["지역"] != "",
-            derived_region,
+        df["지역"] = (
+            df["지역"]
+            .where(
+                df["지역"] != "",
+                derived_region,
+            )
         )
+
     else:
         df["지역"] = derived_region
 
@@ -314,22 +474,29 @@ def load_places(
         .fillna(99)
     )
 
-    df = (
+    return (
         df.sort_values(
-            ["지역", "_order", "이름"],
+            [
+                "지역",
+                "_order",
+                "이름",
+            ],
             kind="stable",
         )
         .drop(columns="_order")
         .reset_index(drop=True)
     )
 
-    return df
-
 
 def get_places() -> pd.DataFrame:
-    """CSV 파일 존재 여부와 로딩 오류를 화면에 표시한다."""
+    """
+    CSV 오류를 Streamlit 화면에 표시한다.
+    """
     if not DATA_PATH.exists():
-        st.error("`data/places.csv`를 찾지 못했습니다.")
+        st.error(
+            "`data/places.csv`를 "
+            "찾지 못했습니다."
+        )
 
         st.code(
             str(DATA_PATH),
@@ -345,7 +512,11 @@ def get_places() -> pd.DataFrame:
         )
 
     except Exception as exc:
-        st.error("CSV를 읽는 중 오류가 발생했습니다.")
+        st.error(
+            "CSV를 읽는 중 "
+            "오류가 발생했습니다."
+        )
+
         st.exception(exc)
         st.stop()
 
@@ -354,7 +525,6 @@ def get_places() -> pd.DataFrame:
 # 세션 상태
 # -----------------------------------------------------------------------------
 def init_state() -> None:
-    """페이지 이동, 포인트, 추천 결과 등을 세션에 보관한다."""
     defaults = {
         NAV_KEY: HOME,
         "points": 0,
@@ -362,39 +532,242 @@ def init_state() -> None:
         "selected_restaurant": "",
         "routes": [],
         "route_index": 0,
-        "route_nonce": 0,
+        "route_generation": 0,
+        "route_variation": 0,
         "queue": None,
         "saved": [],
         "checkins": [],
+        "ai_meta": {
+            "source": "",
+            "model": "",
+            "latency_seconds": 0.0,
+            "interaction_id": "",
+            "repair_count": 0,
+            "warnings": [],
+            "error": "",
+        },
     }
 
     for key, value in defaults.items():
         if key not in st.session_state:
-            st.session_state[key] = deepcopy(value)
+            st.session_state[key] = deepcopy(
+                value
+            )
 
-    if st.session_state[NAV_KEY] not in NAV_ITEMS:
+    if (
+        st.session_state[NAV_KEY]
+        not in NAV_ITEMS
+    ):
         st.session_state[NAV_KEY] = HOME
 
 
 def reset_demo() -> None:
-    """CSV는 그대로 두고 시연 기록만 초기화한다."""
-    st.session_state.points = 0
-    st.session_state.preferences = {}
-    st.session_state.selected_restaurant = ""
-    st.session_state.routes = []
-    st.session_state.route_index = 0
-    st.session_state.route_nonce = 0
-    st.session_state.queue = None
-    st.session_state.saved = []
-    st.session_state.checkins = []
-    st.session_state[NAV_KEY] = HOME
+    """
+    CSV는 유지하고 현재 시연 기록만 초기화한다.
+    """
+    st.session_state.clear()
+    st.rerun()
 
 
 # -----------------------------------------------------------------------------
-# 추천 엔진
+# 추천 코스 생성
 # -----------------------------------------------------------------------------
-def route_id(route: dict[str, Any]) -> str:
-    """저장 코스 중복 확인용 ID를 만든다."""
+def candidate_rows(
+    places: pd.DataFrame,
+    region: str,
+) -> list[dict[str, Any]]:
+    """
+    선택 지역의 맛집 외 장소를 가져온다.
+    """
+    return (
+        places[
+            (places["지역"] == region)
+            & (
+                places["카테고리"]
+                != "맛집"
+            )
+        ]
+        .to_dict("records")
+    )
+
+
+def restaurant_row(
+    places: pd.DataFrame,
+    region: str,
+    restaurant: str,
+) -> dict[str, Any] | None:
+    """
+    선택 맛집의 CSV 행을 가져온다.
+    """
+    rows = places[
+        (places["지역"] == region)
+        & (
+            places["카테고리"]
+            == "맛집"
+        )
+        & (
+            places["이름"]
+            == restaurant
+        )
+    ]
+
+    if rows.empty:
+        return None
+
+    return rows.iloc[0].to_dict()
+
+
+def requested_place_count(
+    wait: int,
+    candidate_count: int,
+) -> int:
+    """
+    코스에 넣을 지역 장소 수.
+    """
+    if wait <= 45:
+        count = 2
+
+    elif wait <= 75:
+        count = 3
+
+    else:
+        count = 4
+
+    return max(
+        1,
+        min(
+            count,
+            candidate_count,
+        ),
+    )
+
+
+def fallback_raw_routes(
+    candidates: list[dict[str, Any]],
+    preferences: dict[str, Any],
+    variation: int,
+) -> list[dict[str, Any]]:
+    """
+    Gemini 호출이 실패한 경우
+    사용할 Python 기본 추천.
+    """
+    target_count = (
+        requested_place_count(
+            int(
+                preferences["wait"]
+            ),
+            len(candidates),
+        )
+    )
+
+    preferred_categories = [
+        INTEREST_CATEGORY[item]
+        for item in preferences.get(
+            "interests",
+            [],
+        )
+        if item in INTEREST_CATEGORY
+    ]
+
+    results: list[dict[str, Any]] = []
+
+    for (
+        route_index,
+        route_info,
+    ) in enumerate(
+        FALLBACK_ROUTES
+    ):
+        (
+            title,
+            badge,
+            summary,
+        ) = route_info
+
+        def sort_key(
+            item: dict[str, Any],
+        ) -> tuple[int, int]:
+            category = str(
+                item.get(
+                    "카테고리",
+                    "",
+                )
+            )
+
+            if (
+                route_index == 1
+                and category
+                in preferred_categories
+            ):
+                category_rank = (
+                    preferred_categories
+                    .index(category)
+                )
+
+            else:
+                category_rank = 0
+
+            seed = (
+                f"{preferences['region']}|"
+                f"{variation}|"
+                f"{route_index}|"
+                f"{item.get('이름', '')}|"
+                f"{item.get('주소', '')}"
+            )
+
+            return (
+                category_rank,
+                stable_number(
+                    seed,
+                    10**9,
+                ),
+            )
+
+        selected = sorted(
+            candidates,
+            key=sort_key,
+        )[:target_count]
+
+        results.append(
+            {
+                "title": title,
+                "badge": badge,
+                "summary": summary,
+                "places": [
+                    {
+                        "name": str(
+                            item.get(
+                                "이름",
+                                "",
+                            )
+                        ),
+                        "reason": (
+                            default_reason(
+                                str(
+                                    item.get(
+                                        "카테고리",
+                                        "장소",
+                                    )
+                                ),
+                                preferences[
+                                    "companion"
+                                ],
+                            )
+                        ),
+                    }
+                    for item in selected
+                ],
+            }
+        )
+
+    return results
+
+
+def route_id(
+    route: dict[str, Any],
+) -> str:
+    """
+    저장 코스 중복 검사용 ID.
+    """
     names = "|".join(
         stop["name"]
         for stop in route["stops"]
@@ -412,156 +785,173 @@ def route_id(route: dict[str, Any]) -> str:
     ).hexdigest()[:14]
 
 
-def build_routes(
+def assemble_routes(
+    raw_routes: list[dict[str, Any]],
     places: pd.DataFrame,
     restaurant_name: str,
     preferences: dict[str, Any],
-    nonce: int = 0,
+    source: str,
 ) -> list[dict[str, Any]]:
     """
-    같은 지역 안에서 세 가지 추천 코스를 만든다.
-
-    현재는 실제 위도·경도가 없으므로 시·군 기준으로 추천한다.
+    Gemini 또는 Python 결과를
+    화면에서 사용할 코스 구조로 바꾼다.
     """
-    region = preferences["region"]
-    wait = int(preferences["wait"])
-    companion = preferences["companion"]
-    interests = preferences["interests"]
+    restaurant = restaurant_row(
+        places,
+        preferences["region"],
+        restaurant_name,
+    )
 
-    local_places = places[
-        places["지역"] == region
-    ].copy()
-
-    restaurant_rows = local_places[
-        (local_places["카테고리"] == "맛집")
-        & (local_places["이름"] == restaurant_name)
-    ]
-
-    candidates = local_places[
-        local_places["카테고리"] != "맛집"
-    ].to_dict("records")
-
-    if restaurant_rows.empty or not candidates:
+    if restaurant is None:
         return []
 
-    restaurant = restaurant_rows.iloc[0].to_dict()
+    candidates = candidate_rows(
+        places,
+        preferences["region"],
+    )
 
-    if wait <= 45:
-        pre_count = 1
-    elif wait <= 75:
-        pre_count = 2
-    else:
-        pre_count = 3
-
-    interest_priority = [
-        INTEREST_CATEGORY[item]
-        for item in interests
-        if item in INTEREST_CATEGORY
-    ]
-
-    results: list[dict[str, Any]] = []
-
-    for variant_index, route_type in enumerate(ROUTE_TYPES):
-        title, badge, description, base_priority = route_type
-
-        priority = list(
-            dict.fromkeys(
-                (
-                    interest_priority
-                    if variant_index == 1
-                    else []
-                )
-                + list(base_priority)
+    by_name = {
+        str(
+            item.get(
+                "이름",
+                "",
             )
-        )
+        ): item
+        for item in candidates
+    }
 
-        seed = (
-            f"{region}|"
-            f"{restaurant_name}|"
-            f"{wait}|"
-            f"{nonce}|"
-            f"{variant_index}"
-        )
+    routes: list[dict[str, Any]] = []
 
-        def sort_key(
-            item: dict[str, Any],
-        ) -> tuple[int, int]:
+    for (
+        route_index,
+        raw_route,
+    ) in enumerate(
+        raw_routes[:3]
+    ):
+        selected: list[dict[str, Any]] = []
+        used: set[str] = set()
+
+        for suggestion in raw_route.get(
+            "places",
+            [],
+        ):
+            name = str(
+                suggestion.get(
+                    "name",
+                    "",
+                )
+            ).strip()
+
+            original = by_name.get(name)
+
+            if (
+                original is None
+                or name in used
+            ):
+                continue
+
+            used.add(name)
+
             category = str(
-                item.get("카테고리", "")
-            )
-
-            if category in priority:
-                rank = priority.index(category)
-            else:
-                rank = len(priority)
-
-            item_seed = (
-                f"{seed}|"
-                f"{item.get('이름')}|"
-                f"{item.get('주소')}"
-            )
-
-            return (
-                rank,
-                stable_number(item_seed, 10**9),
-            )
-
-        ordered = sorted(
-            candidates,
-            key=sort_key,
-        )
-
-        pre_places = ordered[
-            : min(pre_count, len(ordered))
-        ]
-
-        post_place = next(
-            (
-                place
-                for category in (
-                    "카페",
-                    "문화공간",
-                    "관광명소",
+                original.get(
+                    "카테고리",
+                    "장소",
                 )
-                for place in ordered
-                if place not in pre_places
-                and place.get("카테고리") == category
-            ),
-            None,
+            )
+
+            selected.append(
+                {
+                    "name": name,
+                    "category": category,
+                    "address": str(
+                        original.get(
+                            "주소",
+                            "",
+                        )
+                    ),
+                    "reason": (
+                        str(
+                            suggestion.get(
+                                "reason",
+                                "",
+                            )
+                        ).strip()
+                        or default_reason(
+                            category,
+                            preferences[
+                                "companion"
+                            ],
+                        )
+                    ),
+                    "tags": optional_text(
+                        original,
+                        "태그",
+                        "키워드",
+                    ),
+                    "duration_text": (
+                        optional_text(
+                            original,
+                            "체류시간",
+                            "예상체류시간",
+                            "소요시간",
+                        )
+                    ),
+                }
+            )
+
+        if not selected:
+            continue
+
+        # 마지막 추천 장소는
+        # 식사 후 일정으로 사용한다.
+        if len(selected) >= 2:
+            before_places = (
+                selected[:-1]
+            )
+
+            after_place = (
+                selected[-1]
+            )
+
+        else:
+            before_places = selected
+            after_place = None
+
+        wait = int(
+            preferences["wait"]
         )
 
-        usable_wait = max(20, wait - 10)
-
-        per_stop = max(
+        suggested_each = max(
             15,
             min(
-                35,
-                usable_wait
-                // max(1, len(pre_places)),
+                30,
+                max(
+                    20,
+                    wait - 10,
+                )
+                // max(
+                    1,
+                    len(before_places),
+                ),
             ),
         )
 
         stops: list[dict[str, Any]] = []
-        elapsed = 0
 
-        # 식사 전 대기시간 활용 장소
-        for index, place in enumerate(pre_places):
-            category = place.get(
-                "카테고리",
-                "장소",
-            )
-
+        for (
+            place_index,
+            place,
+        ) in enumerate(
+            before_places
+        ):
             duration = min(
                 parse_minutes(
-                    optional_text(
-                        place,
-                        "체류시간",
-                        "예상체류시간",
-                        "소요시간",
-                    ),
-                    per_stop,
+                    place[
+                        "duration_text"
+                    ],
+                    suggested_each,
                 ),
-                per_stop,
+                suggested_each,
             )
 
             stops.append(
@@ -569,41 +959,42 @@ def build_routes(
                     "phase": "대기 활용",
                     "time": (
                         "지금 출발"
-                        if index == 0
-                        else f"+{elapsed}분"
+                        if place_index == 0
+                        else (
+                            "다음 "
+                            f"{place_index + 1}번째"
+                        )
                     ),
-                    "category": category,
-                    "name": place.get("이름", ""),
-                    "address": place.get("주소", ""),
+                    "category": (
+                        place["category"]
+                    ),
+                    "name": place["name"],
+                    "address": (
+                        place["address"]
+                    ),
                     "duration": duration,
-                    "reason": reason_for(
-                        category,
-                        companion,
-                        optional_text(
-                            place,
-                            "설명",
-                            "한줄소개",
-                            "추천이유",
-                        ),
+                    "reason": (
+                        place["reason"]
                     ),
-                    "tags": optional_text(
-                        place,
-                        "태그",
-                        "키워드",
-                    ),
+                    "tags": place["tags"],
                 }
             )
 
-            elapsed += duration
-
-        # 선택 맛집
+        # 선택 맛집을 코스 중간에 삽입한다.
         stops.append(
             {
                 "phase": "식사",
-                "time": f"약 +{wait}분",
+                "time": (
+                    f"대기 약 {wait}분 후"
+                ),
                 "category": "맛집",
-                "name": restaurant.get("이름", ""),
-                "address": restaurant.get("주소", ""),
+                "name": restaurant_name,
+                "address": str(
+                    restaurant.get(
+                        "주소",
+                        "",
+                    )
+                ),
                 "duration": parse_minutes(
                     optional_text(
                         restaurant,
@@ -612,7 +1003,11 @@ def build_routes(
                     ),
                     60,
                 ),
-                "reason": f"예상 대기 {wait}분 후 식사",
+                "reason": (
+                    "대기 순서에 맞춰 "
+                    "선택한 맛집으로 돌아와 "
+                    "식사를 이어가요."
+                ),
                 "tags": optional_text(
                     restaurant,
                     "대표메뉴",
@@ -621,166 +1016,263 @@ def build_routes(
             }
         )
 
-        # 식사 후 장소
-        if post_place:
-            category = post_place.get(
-                "카테고리",
-                "장소",
-            )
-
+        # 식사 후 장소를 마지막에 붙인다.
+        if after_place:
             stops.append(
                 {
-                    "phase": "식후",
+                    "phase": "식후 추천",
                     "time": "식사 후",
-                    "category": category,
-                    "name": post_place.get("이름", ""),
-                    "address": post_place.get("주소", ""),
-                    "duration": parse_minutes(
-                        optional_text(
-                            post_place,
-                            "체류시간",
-                            "예상체류시간",
-                        ),
-                        DEFAULT_DURATION.get(
-                            category,
-                            30,
-                        ),
+                    "category": (
+                        after_place[
+                            "category"
+                        ]
                     ),
-                    "reason": reason_for(
-                        category,
-                        companion,
-                        optional_text(
-                            post_place,
-                            "설명",
-                            "한줄소개",
-                            "추천이유",
-                        ),
+                    "name": (
+                        after_place["name"]
                     ),
-                    "tags": optional_text(
-                        post_place,
-                        "태그",
-                        "키워드",
+                    "address": (
+                        after_place[
+                            "address"
+                        ]
+                    ),
+                    "duration": (
+                        parse_minutes(
+                            after_place[
+                                "duration_text"
+                            ],
+                            DEFAULT_DURATION.get(
+                                after_place[
+                                    "category"
+                                ],
+                                30,
+                            ),
+                        )
+                    ),
+                    "reason": (
+                        after_place[
+                            "reason"
+                        ]
+                    ),
+                    "tags": (
+                        after_place["tags"]
                     ),
                 }
             )
 
+        (
+            fallback_title,
+            fallback_badge,
+            fallback_summary,
+        ) = FALLBACK_ROUTES[
+            min(
+                route_index,
+                2,
+            )
+        ]
+
         route = {
-            "title": title,
-            "badge": badge,
-            "description": description,
-            "region": region,
-            "restaurant": restaurant_name,
+            "title": (
+                str(
+                    raw_route.get(
+                        "title",
+                        "",
+                    )
+                ).strip()
+                or fallback_title
+            ),
+            "badge": (
+                str(
+                    raw_route.get(
+                        "badge",
+                        "",
+                    )
+                ).strip()
+                or fallback_badge
+            ),
+            "summary": (
+                str(
+                    raw_route.get(
+                        "summary",
+                        "",
+                    )
+                ).strip()
+                or fallback_summary
+            ),
+            "region": (
+                preferences["region"]
+            ),
+            "restaurant": (
+                restaurant_name
+            ),
             "wait": wait,
-            "companion": companion,
+            "companion": (
+                preferences[
+                    "companion"
+                ]
+            ),
             "meal": preferences["meal"],
-            "interests": interests,
+            "interests": list(
+                preferences.get(
+                    "interests",
+                    [],
+                )
+            ),
             "stops": stops,
             "local_stay": sum(
                 stop["duration"]
                 for stop in stops
-                if stop["category"] != "맛집"
+                if (
+                    stop["category"]
+                    != "맛집"
+                )
             ),
+            "source": source,
         }
 
         route["id"] = route_id(route)
-        results.append(route)
+        routes.append(route)
 
-    return results
+    return routes
 
 
-# -----------------------------------------------------------------------------
-# 대기표
-# -----------------------------------------------------------------------------
-def create_queue(
-    region: str,
+def create_recommendations(
+    places: pd.DataFrame,
     restaurant: str,
-    wait: int,
-) -> dict[str, Any]:
-    """시연용 대기표를 만든다."""
-    now = datetime.now()
+    preferences: dict[str, Any],
+    variation: int,
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, Any],
+]:
+    """
+    Gemini 추천을 먼저 시도한다.
 
-    region_code = re.sub(
-        r"[^가-힣A-Za-z0-9]",
-        "",
-        region,
-    )[:2] or "GJ"
-
-    ticket_number = 100 + stable_number(
-        f"{restaurant}|{now.isoformat()}",
-        900,
+    실패하면 앱이 멈추지 않고
+    Python 기본 추천으로 전환한다.
+    """
+    candidates = candidate_rows(
+        places,
+        preferences["region"],
     )
 
-    return {
-        "ticket": f"{region_code}-{ticket_number}",
-        "restaurant": restaurant,
-        "wait": wait,
-        "started_at": now.isoformat(
-            timespec="seconds"
+    result = generate_gemini_routes(
+        region=preferences["region"],
+        restaurant=restaurant,
+        wait_minutes=int(
+            preferences["wait"]
         ),
-        "demo_elapsed": 0,
-    }
+        companion=preferences[
+            "companion"
+        ],
+        meal_time=preferences["meal"],
+        interests=preferences.get(
+            "interests",
+            [],
+        ),
+        candidates=candidates,
+        variation=variation,
+    )
 
-
-def queue_status() -> tuple[int, int, int]:
-    """
-    남은 시간, 진행률, 앞 팀 수를 반환한다.
-
-    실제 경과시간과 시연용 경과시간을 함께 사용한다.
-    """
-    queue = st.session_state.queue
-
-    if not queue:
-        return 0, 0, 0
-
-    try:
-        started = datetime.fromisoformat(
-            queue["started_at"]
+    if result["success"]:
+        badges = (
+            "AI 취향형",
+            "AI 발견형",
+            "AI 균형형",
         )
 
-        real_elapsed = max(
-            0,
-            int(
-                (
-                    datetime.now() - started
-                ).total_seconds()
-                // 60
+        raw_routes = [
+            {
+                **route,
+                "badge": badges[index],
+            }
+            for index, route in enumerate(
+                result["routes"][:3]
+            )
+        ]
+
+        routes = assemble_routes(
+            raw_routes,
+            places,
+            restaurant,
+            preferences,
+            "gemini",
+        )
+
+        if routes:
+            return (
+                routes,
+                {
+                    "source": "gemini",
+                    "model": result["model"],
+                    "latency_seconds": (
+                        result[
+                            "latency_seconds"
+                        ]
+                    ),
+                    "interaction_id": (
+                        result[
+                            "interaction_id"
+                        ]
+                    ),
+                    "repair_count": (
+                        result[
+                            "repair_count"
+                        ]
+                    ),
+                    "warnings": result.get(
+                        "warnings",
+                        [],
+                    ),
+                    "error": "",
+                },
+            )
+
+    fallback = fallback_raw_routes(
+        candidates,
+        preferences,
+        variation,
+    )
+
+    routes = assemble_routes(
+        fallback,
+        places,
+        restaurant,
+        preferences,
+        "python",
+    )
+
+    return (
+        routes,
+        {
+            "source": "python",
+            "model": result.get(
+                "model",
+                "",
             ),
-        )
-
-    except (ValueError, TypeError, KeyError):
-        real_elapsed = 0
-
-    wait = max(
-        1,
-        int(queue["wait"]),
+            "latency_seconds": (
+                result.get(
+                    "latency_seconds",
+                    0.0,
+                )
+            ),
+            "interaction_id": "",
+            "repair_count": 0,
+            "warnings": [],
+            "error": result.get(
+                "error",
+                (
+                    "Gemini 추천 결과를 "
+                    "적용하지 못했습니다."
+                ),
+            ),
+        },
     )
-
-    elapsed = min(
-        wait,
-        real_elapsed
-        + int(queue.get("demo_elapsed", 0)),
-    )
-
-    remaining = max(
-        0,
-        wait - elapsed,
-    )
-
-    progress = int(
-        elapsed / wait * 100
-    )
-
-    teams = (
-        0
-        if remaining == 0
-        else max(1, (remaining + 4) // 5)
-    )
-
-    return remaining, progress, teams
 
 
 def active_route() -> dict[str, Any] | None:
-    """현재 선택한 추천 코스를 반환한다."""
+    """
+    현재 선택된 추천 코스를 반환한다.
+    """
     if not st.session_state.routes:
         return None
 
@@ -788,15 +1280,22 @@ def active_route() -> dict[str, Any] | None:
         0,
         min(
             st.session_state.route_index,
-            len(st.session_state.routes) - 1,
+            len(
+                st.session_state.routes
+            )
+            - 1,
         ),
     )
 
-    return st.session_state.routes[index]
+    return st.session_state.routes[
+        index
+    ]
 
 
 def save_active_route() -> None:
-    """현재 코스를 MY 일정에 저장한다."""
+    """
+    현재 코스를 MY 일정에 저장한다.
+    """
     route = active_route()
 
     if not route:
@@ -809,15 +1308,18 @@ def save_active_route() -> None:
 
     if route["id"] in saved_ids:
         st.toast(
-            "이미 저장한 코스입니다.",
+            "이미 저장한 코스예요.",
             icon="ℹ️",
         )
+
         return
 
     saved = deepcopy(route)
 
-    saved["saved_at"] = datetime.now().strftime(
-        "%m.%d %H:%M"
+    saved["saved_at"] = (
+        datetime.now().strftime(
+            "%m.%d %H:%M"
+        )
     )
 
     st.session_state.saved.insert(
@@ -826,8 +1328,135 @@ def save_active_route() -> None:
     )
 
     st.toast(
-        "MY 일정에 저장했습니다.",
+        "MY 일정에 저장했어요.",
         icon="✅",
+    )
+
+
+# -----------------------------------------------------------------------------
+# 시연용 대기표
+# -----------------------------------------------------------------------------
+def create_queue(
+    region: str,
+    restaurant: str,
+    wait: int,
+) -> dict[str, Any]:
+    """
+    시연용 대기표를 만든다.
+    """
+    now = datetime.now()
+
+    code = re.sub(
+        r"[^가-힣A-Za-z0-9]",
+        "",
+        region,
+    )[:2] or "GJ"
+
+    number = (
+        100
+        + stable_number(
+            (
+                f"{restaurant}|"
+                f"{now.isoformat()}"
+            ),
+            900,
+        )
+    )
+
+    return {
+        "ticket": (
+            f"{code}-{number}"
+        ),
+        "restaurant": restaurant,
+        "wait": int(wait),
+        "started_at": (
+            now.isoformat(
+                timespec="seconds"
+            )
+        ),
+        "demo_elapsed": 0,
+    }
+
+
+def queue_status() -> tuple[
+    int,
+    int,
+    int,
+]:
+    """
+    남은 시간, 진행률, 앞 팀 수를 계산한다.
+    """
+    queue = st.session_state.queue
+
+    if not queue:
+        return 0, 0, 0
+
+    try:
+        started = datetime.fromisoformat(
+            queue["started_at"]
+        )
+
+        actual_elapsed = max(
+            0,
+            int(
+                (
+                    datetime.now()
+                    - started
+                ).total_seconds()
+                // 60
+            ),
+        )
+
+    except (
+        ValueError,
+        TypeError,
+        KeyError,
+    ):
+        actual_elapsed = 0
+
+    wait = max(
+        1,
+        int(queue["wait"]),
+    )
+
+    elapsed = min(
+        wait,
+        actual_elapsed
+        + int(
+            queue.get(
+                "demo_elapsed",
+                0,
+            )
+        ),
+    )
+
+    remaining = max(
+        0,
+        wait - elapsed,
+    )
+
+    progress = int(
+        elapsed
+        / wait
+        * 100
+    )
+
+    teams = (
+        0
+        if remaining == 0
+        else max(
+            1,
+            (
+                remaining + 4
+            )
+            // 5,
+        )
+    )
+
+    return (
+        remaining,
+        progress,
+        teams,
     )
 
 
@@ -835,17 +1464,21 @@ def save_active_route() -> None:
 # 모바일 디자인 CSS
 # -----------------------------------------------------------------------------
 def inject_css() -> None:
-    st.markdown(
+    ui(
         """
         <style>
         :root {
-            --green: #0b7c6b;
-            --green-dark: #07584d;
-            --green-soft: #e7f5f1;
-            --orange: #ff7757;
-            --ink: #17221f;
-            --muted: #6b7974;
-            --line: #e0eae6;
+            --green-900: #073f38;
+            --green-800: #075b50;
+            --green-700: #08796a;
+            --green-500: #18a88f;
+            --green-100: #e8f6f2;
+            --cream: #fffaf2;
+            --orange: #ff7658;
+            --yellow: #ffc85a;
+            --ink: #17231f;
+            --muted: #66756f;
+            --line: #dce9e4;
             --paper: #fbfdfc;
         }
 
@@ -864,16 +1497,16 @@ def inject_css() -> None:
         [data-testid="stAppViewContainer"] {
             background:
                 radial-gradient(
-                    circle at 10% 0%,
-                    rgba(11, 124, 107, 0.15),
-                    transparent 30%
+                    circle at 8% 2%,
+                    rgba(24, 168, 143, 0.16),
+                    transparent 28%
                 ),
                 radial-gradient(
-                    circle at 95% 18%,
-                    rgba(255, 119, 87, 0.11),
-                    transparent 25%
+                    circle at 96% 18%,
+                    rgba(255, 118, 88, 0.12),
+                    transparent 24%
                 ),
-                #eaf0ed;
+                #e9efec;
         }
 
         [data-testid="stHeader"],
@@ -887,26 +1520,19 @@ def inject_css() -> None:
         [data-testid="stMainBlockContainer"],
         .block-container {
             width: 100% !important;
-            max-width: 460px !important;
+            max-width: 470px !important;
             min-height: 100vh;
-            padding: 1rem 1rem 8rem !important;
+            padding:
+                1rem
+                1rem
+                7.8rem !important;
             background: var(--paper);
             box-shadow:
-                0 0 48px rgba(31, 62, 54, 0.13);
+                0 0 50px
+                rgba(25, 55, 47, 0.13);
         }
 
-        h1,
-        h2,
-        h3,
-        p {
-            color: var(--ink);
-        }
-
-        p {
-            line-height: 1.55;
-        }
-
-        .topbar {
+        .app-header {
             display: flex;
             align-items: center;
             justify-content: space-between;
@@ -914,99 +1540,117 @@ def inject_css() -> None:
             margin: 0.05rem 0 1rem;
         }
 
-        .brand {
+        .brand-wrap {
             display: flex;
             align-items: center;
-            gap: 0.65rem;
+            gap: 0.68rem;
         }
 
-        .logo {
-            width: 2.65rem;
-            height: 2.65rem;
+        .brand-logo {
+            width: 2.72rem;
+            height: 2.72rem;
             display: grid;
             place-items: center;
-            border-radius: 0.95rem;
+            border-radius: 1rem;
             color: white;
+            font-size: 1.05rem;
             font-weight: 950;
             background:
                 linear-gradient(
                     145deg,
-                    var(--green-dark),
-                    #12a58b
+                    var(--green-900),
+                    var(--green-500)
                 );
             box-shadow:
-                0 9px 18px rgba(11, 124, 107, 0.24);
+                0 10px 22px
+                rgba(8, 121, 106, 0.24);
         }
 
         .brand-name {
-            font-size: 1rem;
+            color: var(--ink);
+            font-size: 1.02rem;
             font-weight: 950;
-            line-height: 1.08;
+            line-height: 1.05;
         }
 
-        .build {
-            margin-top: 0.2rem;
-            color: var(--green);
-            font-size: 0.62rem;
-            font-weight: 900;
-            letter-spacing: 0.06em;
+        .brand-sub {
+            margin-top: 0.22rem;
+            color: var(--muted);
+            font-size: 0.66rem;
+            font-weight: 750;
         }
 
-        .points {
-            padding: 0.52rem 0.72rem;
-            border: 1px solid #d8e6e1;
+        .point-pill {
+            padding: 0.55rem 0.72rem;
+            border:
+                1px solid
+                var(--line);
             border-radius: 999px;
             background: white;
-            color: var(--green-dark);
-            font-size: 0.8rem;
+            color: var(--green-800);
+            font-size: 0.78rem;
             font-weight: 900;
+            box-shadow:
+                0 6px 15px
+                rgba(30, 61, 53, 0.05);
         }
 
         .hero {
             position: relative;
             overflow: hidden;
-            padding: 1.45rem 1.3rem 1.35rem;
-            margin-bottom: 1rem;
-            border-radius: 1.65rem;
+            padding:
+                1.5rem
+                1.35rem
+                1.35rem;
+            border-radius: 1.7rem;
             color: white;
             background:
                 linear-gradient(
                     145deg,
-                    var(--green-dark),
-                    var(--green) 58%,
-                    #18aa8d
+                    var(--green-900),
+                    var(--green-700) 58%,
+                    #1ca88f
                 );
             box-shadow:
-                0 18px 36px rgba(7, 88, 77, 0.23);
+                0 20px 38px
+                rgba(7, 91, 80, 0.23);
         }
 
         .hero::before {
             content: "";
             position: absolute;
-            width: 10rem;
-            height: 10rem;
-            right: -4.6rem;
-            top: -4.8rem;
+            width: 11rem;
+            height: 11rem;
+            right: -5rem;
+            top: -5rem;
             border-radius: 50%;
             background:
-                rgba(255, 255, 255, 0.13);
+                rgba(
+                    255,
+                    255,
+                    255,
+                    0.12
+                );
         }
 
         .hero::after {
             content: "";
             position: absolute;
-            width: 6rem;
-            height: 6rem;
-            right: 1.1rem;
-            bottom: -4.2rem;
+            width: 6.5rem;
+            height: 6.5rem;
+            right: 1rem;
+            bottom: -4.6rem;
             border-radius: 50%;
             background:
-                rgba(255, 207, 90, 0.27);
+                rgba(
+                    255,
+                    200,
+                    90,
+                    0.28
+                );
         }
 
-        .hero-chip,
-        .hero-title,
-        .hero-copy {
+        .hero > * {
             position: relative;
             z-index: 1;
         }
@@ -1016,105 +1660,636 @@ def inject_css() -> None:
             padding: 0.34rem 0.62rem;
             border-radius: 999px;
             background:
-                rgba(255, 255, 255, 0.15);
-            font-size: 0.69rem;
+                rgba(
+                    255,
+                    255,
+                    255,
+                    0.15
+                );
+            font-size: 0.68rem;
             font-weight: 850;
         }
 
         .hero-title {
-            max-width: 18rem;
-            margin: 0.8rem 0 0.48rem;
+            margin:
+                0.82rem
+                0
+                0.48rem;
+            max-width: 20rem;
             color: white;
             font-size: 1.72rem;
             line-height: 1.2;
             font-weight: 950;
-            letter-spacing: -0.04em;
+            letter-spacing: -0.045em;
         }
 
         .hero-copy {
-            max-width: 20rem;
             margin: 0;
+            max-width: 20rem;
             color:
-                rgba(255, 255, 255, 0.86);
-            font-size: 0.84rem;
+                rgba(
+                    255,
+                    255,
+                    255,
+                    0.84
+                );
+            font-size: 0.82rem;
         }
 
-        .stats {
+        .hero-orbit {
+            position: absolute;
+            right: 1.1rem;
+            top: 4.5rem;
+            width: 4.25rem;
+            height: 4.25rem;
+            display: grid;
+            place-items: center;
+            border-radius: 1.35rem;
+            background:
+                rgba(
+                    255,
+                    255,
+                    255,
+                    0.13
+                );
+            border:
+                1px solid
+                rgba(
+                    255,
+                    255,
+                    255,
+                    0.18
+                );
+            font-size: 1.85rem;
+            transform: rotate(6deg);
+        }
+
+        .stats-grid {
             display: grid;
             grid-template-columns:
                 repeat(3, 1fr);
             gap: 0.52rem;
-            margin: 0.8rem 0 1.2rem;
+            margin:
+                0.82rem
+                0
+                1.25rem;
         }
 
-        .stat {
-            padding: 0.76rem 0.45rem;
-            border: 1px solid var(--line);
+        .stat-card {
+            padding:
+                0.78rem
+                0.42rem;
+            border:
+                1px solid
+                var(--line);
             border-radius: 1rem;
             background: white;
             text-align: center;
             box-shadow:
-                0 7px 17px rgba(36, 65, 57, 0.045);
+                0 7px 17px
+                rgba(36, 65, 57, 0.045);
         }
 
-        .stat strong {
+        .stat-card strong {
             display: block;
-            font-size: 1.01rem;
+            color: var(--ink);
+            font-size: 1.02rem;
         }
 
-        .stat span {
-            font-size: 0.65rem;
+        .stat-card span {
             color: var(--muted);
+            font-size: 0.64rem;
         }
 
-        .section {
+        .section-head {
             display: flex;
             align-items: flex-end;
             justify-content: space-between;
             gap: 0.6rem;
-            margin: 1.22rem 0 0.7rem;
+            margin:
+                1.28rem
+                0
+                0.7rem;
         }
 
-        .eyebrow {
-            color: var(--green);
-            font-size: 0.64rem;
-            font-weight: 900;
-            letter-spacing: 0.08em;
+        .section-eyebrow {
+            color: var(--green-700);
+            font-size: 0.63rem;
+            font-weight: 950;
+            letter-spacing: 0.09em;
         }
 
-        .title {
-            margin: 0.15rem 0 0;
-            font-size: 1.13rem;
+        .section-title {
+            margin-top: 0.14rem;
+            color: var(--ink);
+            font-size: 1.14rem;
             font-weight: 950;
             letter-spacing: -0.025em;
         }
 
-        .caption {
+        .section-caption {
             color: var(--muted);
-            font-size: 0.68rem;
+            font-size: 0.66rem;
             text-align: right;
         }
 
-        .card,
-        .queue,
-        .empty,
-        .mission,
-        .saved {
+        .ai-ready,
+        .ai-proof {
+            display: flex;
+            align-items: center;
+            gap: 0.72rem;
+            padding:
+                0.82rem
+                0.9rem;
+            border-radius: 1.1rem;
+            border:
+                1px solid
+                #cfe9e1;
+            background:
+                linear-gradient(
+                    135deg,
+                    #f1fbf8,
+                    #ffffff
+                );
+            box-shadow:
+                0 7px 17px
+                rgba(36, 65, 57, 0.045);
+        }
+
+        .ai-ready {
+            margin:
+                0.75rem
+                0
+                1rem;
+        }
+
+        .ai-proof {
+            margin:
+                0.72rem
+                0
+                0.95rem;
+        }
+
+        .ai-proof.fallback {
+            border-color: #f0d9ba;
+            background:
+                linear-gradient(
+                    135deg,
+                    #fff8ed,
+                    #ffffff
+                );
+        }
+
+        .ai-symbol {
+            flex: 0 0 auto;
+            width: 2.35rem;
+            height: 2.35rem;
+            display: grid;
+            place-items: center;
+            border-radius: 0.85rem;
+            background:
+                var(--green-700);
+            color: white;
+            font-size: 1.05rem;
+            box-shadow:
+                0 7px 15px
+                rgba(8, 121, 106, 0.2);
+        }
+
+        .ai-proof.fallback
+        .ai-symbol {
+            background: #d88931;
+        }
+
+        .ai-copy {
+            min-width: 0;
+            flex: 1;
+        }
+
+        .ai-copy strong {
+            display: block;
+            color: var(--ink);
+            font-size: 0.79rem;
+        }
+
+        .ai-copy span {
+            display: block;
+            margin-top: 0.16rem;
+            color: var(--muted);
+            font-size: 0.65rem;
+        }
+
+        .ai-check {
+            color: var(--green-700);
+            font-size: 1rem;
+            font-weight: 950;
+        }
+
+        .queue-card {
             padding: 1rem;
-            border: 1px solid var(--line);
-            border-radius: 1.22rem;
+            border:
+                1px solid
+                var(--line);
+            border-radius: 1.25rem;
+            background:
+                linear-gradient(
+                    145deg,
+                    #ffffff,
+                    #effaf7
+                );
+            box-shadow:
+                0 9px 21px
+                rgba(36, 65, 57, 0.06);
+        }
+
+        .queue-top {
+            display: flex;
+            justify-content: space-between;
+            gap: 0.8rem;
+        }
+
+        .queue-ticket {
+            color: var(--green-700);
+            font-size: 0.64rem;
+            font-weight: 950;
+        }
+
+        .queue-name {
+            margin-top: 0.22rem;
+            color: var(--ink);
+            font-size: 0.98rem;
+            font-weight: 950;
+        }
+
+        .queue-right {
+            text-align: right;
+        }
+
+        .queue-right strong {
+            display: block;
+            color: var(--green-800);
+            font-size: 1.32rem;
+            line-height: 1.05;
+        }
+
+        .queue-right span {
+            color: var(--muted);
+            font-size: 0.64rem;
+        }
+
+        .progress-track {
+            height: 0.58rem;
+            margin-top: 0.85rem;
+            overflow: hidden;
+            border-radius: 999px;
+            background: #dbe9e4;
+        }
+
+        .progress-bar {
+            height: 100%;
+            border-radius: 999px;
+            background:
+                linear-gradient(
+                    90deg,
+                    var(--green-700),
+                    #28b696
+                );
+        }
+
+        .queue-bottom {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 0.45rem;
+            color: var(--muted);
+            font-size: 0.62rem;
+        }
+
+        .route-hero {
+            position: relative;
+            overflow: hidden;
+            padding: 1.15rem;
+            margin:
+                0.78rem
+                0
+                1rem;
+            border-radius: 1.4rem;
+            color: white;
+            background:
+                linear-gradient(
+                    140deg,
+                    #183a32,
+                    var(--green-700)
+                );
+            box-shadow:
+                0 15px 30px
+                rgba(20, 64, 54, 0.2);
+        }
+
+        .route-hero::after {
+            content: "";
+            position: absolute;
+            width: 7rem;
+            height: 7rem;
+            right: -2.8rem;
+            top: -3rem;
+            border-radius: 50%;
+            background:
+                rgba(
+                    255,
+                    255,
+                    255,
+                    0.1
+                );
+        }
+
+        .route-badge {
+            position: relative;
+            display: inline-flex;
+            padding: 0.28rem 0.55rem;
+            border-radius: 999px;
+            background:
+                rgba(
+                    255,
+                    255,
+                    255,
+                    0.15
+                );
+            font-size: 0.62rem;
+            font-weight: 900;
+        }
+
+        .route-title {
+            position: relative;
+            margin:
+                0.55rem
+                0
+                0.28rem;
+            color: white;
+            font-size: 1.2rem;
+            font-weight: 950;
+            letter-spacing: -0.02em;
+        }
+
+        .route-summary {
+            position: relative;
+            margin: 0;
+            max-width: 20rem;
+            color:
+                rgba(
+                    255,
+                    255,
+                    255,
+                    0.82
+                );
+            font-size: 0.75rem;
+        }
+
+        .route-meta {
+            position: relative;
+            display: grid;
+            grid-template-columns:
+                repeat(3, 1fr);
+            gap: 0.42rem;
+            margin-top: 0.85rem;
+        }
+
+        .route-meta-item {
+            padding:
+                0.5rem
+                0.25rem;
+            border-radius: 0.78rem;
+            background:
+                rgba(
+                    255,
+                    255,
+                    255,
+                    0.1
+                );
+            text-align: center;
+        }
+
+        .route-meta-item strong {
+            display: block;
+            color: white;
+            font-size: 0.78rem;
+        }
+
+        .route-meta-item span {
+            color:
+                rgba(
+                    255,
+                    255,
+                    255,
+                    0.68
+                );
+            font-size: 0.57rem;
+        }
+
+        .timeline-row {
+            display: grid;
+            grid-template-columns:
+                2.55rem
+                1fr;
+            gap: 0.65rem;
+        }
+
+        .timeline-rail {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .step-dot {
+            width: 2.3rem;
+            height: 2.3rem;
+            display: grid;
+            place-items: center;
+            z-index: 1;
+            border-radius: 0.85rem;
+            color: white;
+            font-size: 0.82rem;
+            font-weight: 950;
+            background:
+                var(--green-700);
+            box-shadow:
+                0 7px 15px
+                rgba(8, 121, 106, 0.18);
+        }
+
+        .step-dot.food {
+            background: var(--orange);
+        }
+
+        .step-dot.culture {
+            background: #7c6bd3;
+        }
+
+        .step-dot.cafe {
+            background: #a96d3b;
+        }
+
+        .step-line {
+            width: 2px;
+            flex: 1;
+            min-height: 1rem;
+            background: #dbe9e4;
+        }
+
+        .place-card {
+            margin-bottom: 0.72rem;
+            padding:
+                0.88rem
+                0.9rem;
+            border:
+                1px solid
+                var(--line);
+            border-radius: 1.1rem;
             background: white;
             box-shadow:
-                0 8px 20px rgba(36, 65, 57, 0.055);
+                0 8px 20px
+                rgba(36, 65, 57, 0.055);
         }
 
-        .card,
-        .saved {
-            margin-bottom: 0.75rem;
+        .place-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.45rem;
         }
 
-        .empty {
-            padding: 1.5rem 1rem;
+        .phase-chip {
+            display: inline-flex;
+            padding: 0.24rem 0.48rem;
+            border-radius: 999px;
+            background:
+                var(--green-100);
+            color: var(--green-800);
+            font-size: 0.59rem;
+            font-weight: 950;
+        }
+
+        .phase-chip.food {
+            background: #fff0ec;
+            color: #c24f36;
+        }
+
+        .place-time {
+            color: var(--muted);
+            font-size: 0.6rem;
+            text-align: right;
+        }
+
+        .place-name {
+            margin-top: 0.48rem;
+            color: var(--ink);
+            font-size: 0.94rem;
+            font-weight: 950;
+        }
+
+        .place-reason {
+            margin-top: 0.27rem;
+            color: #51615b;
+            font-size: 0.7rem;
+            line-height: 1.5;
+        }
+
+        .place-address {
+            margin-top: 0.42rem;
+            color: #7a8782;
+            font-size: 0.62rem;
+        }
+
+        .place-footer {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.55rem;
+            margin-top: 0.55rem;
+        }
+
+        .tag-text {
+            color: var(--orange);
+            font-size: 0.6rem;
+            font-weight: 850;
+        }
+
+        .map-link {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.32rem 0.52rem;
+            border-radius: 0.65rem;
+            background: #f1f6f4;
+            color:
+                var(--green-800)
+                !important;
+            font-size: 0.61rem;
+            font-weight: 900;
+            text-decoration:
+                none
+                !important;
+        }
+
+        .reward-card {
+            margin:
+                0.85rem
+                0;
+            padding: 0.95rem;
+            border:
+                1px solid
+                #f0dca8;
+            border-radius: 1.18rem;
+            background:
+                linear-gradient(
+                    145deg,
+                    #fff9eb,
+                    #ffffff
+                );
+            box-shadow:
+                0 8px 20px
+                rgba(82, 65, 25, 0.045);
+        }
+
+        .reward-card small {
+            color: #a86c00;
+            font-size: 0.6rem;
+            font-weight: 950;
+            letter-spacing: 0.08em;
+        }
+
+        .reward-card strong {
+            display: block;
+            margin:
+                0.3rem
+                0
+                0.2rem;
+            color: var(--ink);
+            font-size: 0.88rem;
+        }
+
+        .reward-card span {
+            color: var(--muted);
+            font-size: 0.68rem;
+        }
+
+        .empty-card,
+        .saved-card,
+        .simple-card {
+            padding: 1rem;
+            margin-bottom: 0.72rem;
+            border:
+                1px solid
+                var(--line);
+            border-radius: 1.18rem;
+            background: white;
+            box-shadow:
+                0 8px 20px
+                rgba(36, 65, 57, 0.055);
+        }
+
+        .empty-card {
+            padding:
+                1.45rem
+                1rem;
             text-align: center;
         }
 
@@ -1122,363 +2297,118 @@ def inject_css() -> None:
             font-size: 2rem;
         }
 
-        .empty strong {
+        .empty-card strong {
             display: block;
-            margin: 0.4rem 0 0.25rem;
+            margin:
+                0.4rem
+                0
+                0.22rem;
+            color: var(--ink);
         }
 
-        .empty span {
+        .empty-card span {
             color: var(--muted);
-            font-size: 0.78rem;
-        }
-
-        .queue {
-            background:
-                linear-gradient(
-                    145deg,
-                    white,
-                    #effaf7
-                );
-        }
-
-        .queue-top {
-            display: flex;
-            justify-content: space-between;
-            gap: 0.7rem;
-        }
-
-        .q-ticket {
-            color: var(--green);
-            font-size: 0.66rem;
-            font-weight: 900;
-        }
-
-        .q-name {
-            margin-top: 0.2rem;
-            font-size: 1rem;
-            font-weight: 950;
-        }
-
-        .q-right {
-            text-align: right;
-        }
-
-        .q-right strong {
-            display: block;
-            color: var(--green-dark);
-            font-size: 1.4rem;
-            line-height: 1;
-        }
-
-        .q-right span,
-        .q-bottom {
-            color: var(--muted);
-            font-size: 0.65rem;
-        }
-
-        .track {
-            height: 0.58rem;
-            margin-top: 0.85rem;
-            overflow: hidden;
-            border-radius: 999px;
-            background: #dceae5;
-        }
-
-        .bar {
-            height: 100%;
-            border-radius: 999px;
-            background:
-                linear-gradient(
-                    90deg,
-                    var(--green),
-                    #25b596
-                );
-        }
-
-        .q-bottom {
-            display: flex;
-            justify-content: space-between;
-            margin-top: 0.45rem;
-        }
-
-        .route {
-            padding: 1.05rem;
-            margin: 0.75rem 0;
-            border-radius: 1.28rem;
-            color: white;
-            background:
-                linear-gradient(
-                    140deg,
-                    #213a34,
-                    var(--green)
-                );
-            box-shadow:
-                0 12px 25px rgba(20, 64, 54, 0.18);
-        }
-
-        .badge {
-            display: inline-flex;
-            padding: 0.26rem 0.5rem;
-            border-radius: 999px;
-            background:
-                rgba(255, 255, 255, 0.16);
-            font-size: 0.64rem;
-            font-weight: 850;
-        }
-
-        .route h3 {
-            margin: 0.52rem 0 0.25rem;
-            color: white;
-            font-size: 1.18rem;
-        }
-
-        .route p {
-            margin: 0;
-            color:
-                rgba(255, 255, 255, 0.8);
             font-size: 0.76rem;
         }
 
-        .route-meta {
-            display: grid;
-            grid-template-columns:
-                repeat(3, 1fr);
-            gap: 0.4rem;
-            margin-top: 0.78rem;
-        }
-
-        .route-meta div {
-            padding: 0.48rem 0.3rem;
-            border-radius: 0.76rem;
-            background:
-                rgba(255, 255, 255, 0.11);
-            text-align: center;
-        }
-
-        .route-meta strong {
-            display: block;
-            color: white;
-            font-size: 0.8rem;
-        }
-
-        .route-meta span {
-            color:
-                rgba(255, 255, 255, 0.7);
-            font-size: 0.59rem;
-        }
-
-        .timeline {
-            position: relative;
-            margin: 0.15rem 0 0.8rem;
-        }
-
-        .timeline::before {
-            content: "";
-            position: absolute;
-            left: 1.13rem;
-            top: 1.2rem;
-            bottom: 1.2rem;
-            width: 2px;
-            background: #dcebe6;
-        }
-
-        .stop {
-            position: relative;
-            display: grid;
-            grid-template-columns:
-                2.3rem 1fr;
-            gap: 0.68rem;
-            padding: 0.7rem 0;
-        }
-
-        .stop-icon {
-            z-index: 1;
-            width: 2.3rem;
-            height: 2.3rem;
-            display: grid;
-            place-items: center;
-            border: 1px solid #d4e7e0;
-            border-radius: 0.82rem;
-            background: white;
-            box-shadow:
-                0 5px 12px rgba(22, 73, 61, 0.08);
-        }
-
-        .stop-body {
-            padding: 0.78rem 0.82rem;
-            border: 1px solid var(--line);
-            border-radius: 1.02rem;
-            background: white;
-        }
-
-        .stop-top {
-            display: flex;
-            justify-content: space-between;
-            gap: 0.5rem;
-        }
-
-        .stop-phase {
-            color: var(--green);
+        .card-kicker {
+            color: var(--green-700);
             font-size: 0.62rem;
-            font-weight: 900;
-        }
-
-        .stop-time {
-            color: var(--muted);
-            font-size: 0.62rem;
-        }
-
-        .stop-name {
-            margin-top: 0.23rem;
-            font-size: 0.91rem;
             font-weight: 950;
         }
 
-        .stop-reason {
+        .card-title {
             margin-top: 0.25rem;
-            color: #53625d;
-            font-size: 0.71rem;
-        }
-
-        .stop-address {
-            margin-top: 0.38rem;
-            color: #7a8782;
-            font-size: 0.64rem;
-        }
-
-        .stop-tags {
-            margin-top: 0.36rem;
-            color: var(--orange);
-            font-size: 0.63rem;
-            font-weight: 850;
-        }
-
-        .map {
-            display: inline-block;
-            margin-top: 0.4rem;
-            color: var(--green-dark) !important;
-            font-size: 0.65rem;
-            font-weight: 850;
-            text-decoration: none;
-        }
-
-        .mission {
-            margin: 0.85rem 0;
-            border-color: #f0dcaa;
-            background:
-                linear-gradient(
-                    145deg,
-                    #fffaf0,
-                    white
-                );
-        }
-
-        .mission small {
-            color: #ae7000;
-            font-weight: 900;
-        }
-
-        .mission strong {
-            display: block;
-            margin: 0.25rem 0;
-            font-size: 0.92rem;
-        }
-
-        .mission span {
-            color: var(--muted);
-            font-size: 0.72rem;
-        }
-
-        .place-kind {
-            color: var(--green);
-            font-size: 0.66rem;
-            font-weight: 900;
-        }
-
-        .place-name {
-            margin-top: 0.25rem;
-            font-size: 1rem;
+            color: var(--ink);
+            font-size: 0.94rem;
             font-weight: 950;
         }
 
-        .place-address {
-            margin-top: 0.32rem;
+        .card-copy {
+            margin-top: 0.3rem;
             color: var(--muted);
-            font-size: 0.7rem;
+            font-size: 0.68rem;
         }
 
-        .done {
+        .done-pill {
             display: inline-flex;
-            margin-top: 0.5rem;
+            margin-top: 0.52rem;
             padding: 0.28rem 0.52rem;
             border-radius: 999px;
-            background: var(--green-soft);
-            color: var(--green-dark);
-            font-size: 0.64rem;
+            background:
+                var(--green-100);
+            color: var(--green-800);
+            font-size: 0.62rem;
             font-weight: 900;
         }
 
-        .saved-top {
+        .saved-head {
             display: flex;
+            align-items: flex-start;
             justify-content: space-between;
             gap: 0.5rem;
-        }
-
-        .saved-title {
-            font-size: 0.9rem;
-            font-weight: 950;
         }
 
         .saved-time {
             color: var(--muted);
-            font-size: 0.62rem;
+            font-size: 0.6rem;
+            white-space: nowrap;
         }
 
-        .saved-copy {
-            margin-top: 0.27rem;
-            color: var(--muted);
-            font-size: 0.7rem;
-        }
-
-        .history {
+        .history-row {
             display: flex;
             justify-content: space-between;
-            gap: 0.5rem;
-            padding: 0.68rem 0;
-            border-bottom: 1px solid #edf2f0;
+            gap: 0.6rem;
+            padding:
+                0.67rem
+                0;
+            border-bottom:
+                1px solid
+                #edf2f0;
         }
 
-        .history:last-child {
+        .history-row:last-child {
             border-bottom: 0;
         }
 
         .history-name {
-            font-size: 0.76rem;
+            color: var(--ink);
+            font-size: 0.74rem;
             font-weight: 850;
         }
 
         .history-time {
+            margin-top: 0.15rem;
             color: var(--muted);
-            font-size: 0.64rem;
+            font-size: 0.61rem;
         }
 
-        .history-points {
-            color: var(--green);
-            font-size: 0.73rem;
+        .history-point {
+            color: var(--green-700);
+            font-size: 0.72rem;
             font-weight: 950;
         }
 
-        div[data-baseweb="select"] > div,
-        [data-testid="stTextInput"] input {
+        div[data-baseweb="select"]
+        > div,
+        [data-testid="stTextInput"]
+        input {
             min-height: 3rem;
-            border-radius: 0.9rem !important;
-            border-color: #dce7e3 !important;
-            background: white !important;
+            border-radius:
+                0.92rem
+                !important;
+            border-color:
+                #d9e6e1
+                !important;
+            background:
+                white
+                !important;
         }
 
-        [data-testid="stWidgetLabel"] p {
+        [data-testid="stWidgetLabel"]
+        p {
             color: #40504a;
-            font-size: 0.75rem;
+            font-size: 0.74rem;
             font-weight: 850;
         }
 
@@ -1486,176 +2416,238 @@ def inject_css() -> None:
             width: 100%;
             min-height: 3rem;
             border-radius: 0.93rem;
-            border: 1px solid #d6e4df;
+            border:
+                1px solid
+                #d6e4df;
             font-weight: 900;
         }
 
-        .stButton > button[kind="primary"] {
+        .stButton
+        > button[kind="primary"] {
             border: 0;
             color: white;
             background:
                 linear-gradient(
                     135deg,
-                    var(--green-dark),
+                    var(--green-900),
                     #0e927a
                 );
             box-shadow:
-                0 10px 20px rgba(11, 124, 107, 0.18);
+                0 10px 20px
+                rgba(8, 120, 106, 0.18);
         }
 
         [data-testid="stCameraInput"] {
             overflow: hidden;
-            border: 1px solid var(--line);
+            border:
+                1px solid
+                var(--line);
             border-radius: 1.2rem;
             background: white;
         }
 
-        /* 동행 유형과 식사 시간 */
-        .st-key-home_companion [role="radiogroup"],
-        .st-key-home_meal [role="radiogroup"] {
-            display: grid !important;
+        .st-key-home_companion
+        [role="radiogroup"],
+        .st-key-home_meal
+        [role="radiogroup"] {
+            display:
+                grid
+                !important;
             grid-template-columns:
                 repeat(4, 1fr);
             gap: 0.34rem;
         }
 
-        /* 추천 코스 3안 */
-        .st-key-route_picker [role="radiogroup"] {
-            display: grid !important;
+        [class*="st-key-route_choice_"]
+        [role="radiogroup"] {
+            display:
+                grid
+                !important;
             grid-template-columns:
                 repeat(3, 1fr);
             gap: 0.34rem;
         }
 
-        .st-key-home_companion label,
-        .st-key-home_meal label,
-        .st-key-route_picker label {
+        .st-key-home_companion
+        label,
+        .st-key-home_meal
+        label,
+        [class*="st-key-route_choice_"]
+        label {
             justify-content: center;
             min-height: 2.5rem;
-            padding: 0.3rem 0.15rem !important;
-            border: 1px solid #dce7e3;
+            padding:
+                0.3rem
+                0.13rem
+                !important;
+            border:
+                1px solid
+                #dce7e3;
             border-radius: 0.8rem;
             background: white;
             text-align: center;
         }
 
-        .st-key-home_companion label:has(input:checked),
-        .st-key-home_meal label:has(input:checked),
-        .st-key-route_picker label:has(input:checked) {
-            border-color: #9fd5c8;
-            background: var(--green-soft);
-        }
-
-        .st-key-home_companion label > div:first-child,
-        .st-key-home_meal label > div:first-child,
-        .st-key-route_picker label > div:first-child {
-            display: none;
-        }
-
-        .st-key-home_companion p,
-        .st-key-home_meal p,
-        .st-key-route_picker p {
-            font-size: 0.68rem;
-            font-weight: 850;
-        }
-
-        /* 하단 고정 모바일 메뉴 */
-        .st-key-bottom_nav {
-            position: fixed;
-            left: 50%;
-            bottom: 0.65rem;
-            transform: translateX(-50%);
-            z-index: 9999;
-            width:
-                min(
-                    430px,
-                    calc(100vw - 1.2rem)
-                );
-            padding: 0.38rem;
-            border:
-                1px solid rgba(206, 222, 216, 0.95);
-            border-radius: 1.22rem;
-            background:
-                rgba(255, 255, 255, 0.94);
-            box-shadow:
-                0 14px 35px rgba(29, 57, 49, 0.2);
-            backdrop-filter: blur(16px);
-        }
-
-        .st-key-bottom_nav
-        [data-testid="stWidgetLabel"] {
-            display: none;
-        }
-
-        .st-key-bottom_nav [role="radiogroup"] {
-            display: grid !important;
-            grid-template-columns:
-                repeat(4, 1fr);
-            gap: 0.23rem;
-        }
-
-        .st-key-bottom_nav label {
-            justify-content: center;
-            min-height: 3rem;
-            padding: 0.32rem 0.12rem !important;
-            border-radius: 0.88rem;
-            text-align: center;
-        }
-
-        .st-key-bottom_nav
+        .st-key-home_companion
+        label:has(input:checked),
+        .st-key-home_meal
+        label:has(input:checked),
+        [class*="st-key-route_choice_"]
         label:has(input:checked) {
-            background: var(--green-soft);
+            border-color: #9fd5c8;
+            background:
+                var(--green-100);
         }
 
-        .st-key-bottom_nav
-        label > div:first-child {
+        .st-key-home_companion
+        label
+        > div:first-child,
+        .st-key-home_meal
+        label
+        > div:first-child,
+        [class*="st-key-route_choice_"]
+        label
+        > div:first-child {
             display: none;
         }
 
-        .st-key-bottom_nav p {
-            color: #66736f;
+        .st-key-home_companion
+        p,
+        .st-key-home_meal
+        p,
+        [class*="st-key-route_choice_"]
+        p {
             font-size: 0.67rem;
             font-weight: 850;
         }
 
-        .st-key-bottom_nav
-        label:has(input:checked) p {
-            color: var(--green-dark);
+        .st-key-app_nav {
+            position: fixed;
+            left: 50%;
+            bottom: 0.62rem;
+            transform:
+                translateX(-50%);
+            z-index: 9999;
+            width:
+                min(
+                    435px,
+                    calc(
+                        100vw
+                        - 1.2rem
+                    )
+                );
+            padding: 0.38rem;
+            border:
+                1px solid
+                rgba(
+                    204,
+                    220,
+                    214,
+                    0.96
+                );
+            border-radius: 1.22rem;
+            background:
+                rgba(
+                    255,
+                    255,
+                    255,
+                    0.95
+                );
+            box-shadow:
+                0 15px 36px
+                rgba(29, 57, 49, 0.2);
+            backdrop-filter:
+                blur(16px);
         }
 
-        .note {
-            color: var(--muted);
-            font-size: 0.65rem;
-            line-height: 1.5;
+        .st-key-app_nav
+        [data-testid="stWidgetLabel"] {
+            display: none;
         }
 
-        .divider {
-            height: 1px;
-            margin: 1rem 0;
-            background: var(--line);
+        .st-key-app_nav
+        [role="radiogroup"] {
+            display:
+                grid
+                !important;
+            grid-template-columns:
+                repeat(4, 1fr);
+            gap: 0.22rem;
         }
 
-        @media (max-width: 640px) {
+        .st-key-app_nav
+        label {
+            justify-content: center;
+            min-height: 3rem;
+            padding:
+                0.3rem
+                0.1rem
+                !important;
+            border-radius: 0.88rem;
+            text-align: center;
+        }
+
+        .st-key-app_nav
+        label:has(input:checked) {
+            background:
+                var(--green-100);
+        }
+
+        .st-key-app_nav
+        label
+        > div:first-child {
+            display: none;
+        }
+
+        .st-key-app_nav
+        p {
+            color: #66736f;
+            font-size: 0.66rem;
+            font-weight: 850;
+        }
+
+        .st-key-app_nav
+        label:has(input:checked)
+        p {
+            color: var(--green-900);
+        }
+
+        @media (
+            max-width: 640px
+        ) {
             [data-testid="stMainBlockContainer"],
             .block-container {
-                max-width: none !important;
+                max-width:
+                    none
+                    !important;
                 padding:
-                    0.85rem 0.9rem 7.6rem !important;
+                    0.85rem
+                    0.9rem
+                    7.5rem
+                    !important;
                 box-shadow: none;
             }
 
             .hero-title {
-                font-size: 1.56rem;
+                font-size: 1.55rem;
             }
 
-            .st-key-bottom_nav {
-                bottom: 0.4rem;
-                width: calc(100vw - 1rem);
+            .hero-orbit {
+                right: 0.7rem;
+                opacity: 0.9;
+            }
+
+            .st-key-app_nav {
+                bottom: 0.38rem;
+                width:
+                    calc(
+                        100vw
+                        - 1rem
+                    );
             }
         }
         </style>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
@@ -1663,29 +2655,30 @@ def inject_css() -> None:
 # 공통 UI
 # -----------------------------------------------------------------------------
 def render_header() -> None:
-    st.markdown(
+    ui(
         f"""
-        <div class="topbar">
-            <div class="brand">
-                <div class="logo">W</div>
+        <div class="app-header">
+            <div class="brand-wrap">
+                <div class="brand-logo">
+                    W
+                </div>
 
                 <div>
                     <div class="brand-name">
                         {APP_NAME}
                     </div>
 
-                    <div class="build">
-                        {APP_SUBTITLE} · {BUILD}
+                    <div class="brand-sub">
+                        {APP_SUBTITLE}
                     </div>
                 </div>
             </div>
 
-            <div class="points">
+            <div class="point-pill">
                 🪙 {st.session_state.points:,}P
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
@@ -1694,25 +2687,24 @@ def render_section(
     eyebrow: str = "",
     caption: str = "",
 ) -> None:
-    st.markdown(
+    ui(
         f"""
-        <div class="section">
+        <div class="section-head">
             <div>
-                <div class="eyebrow">
+                <div class="section-eyebrow">
                     {h(eyebrow)}
                 </div>
 
-                <h3 class="title">
+                <div class="section-title">
                     {h(title)}
-                </h3>
+                </div>
             </div>
 
-            <div class="caption">
+            <div class="section-caption">
                 {h(caption)}
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
@@ -1721,9 +2713,9 @@ def render_empty(
     title: str,
     copy: str,
 ) -> None:
-    st.markdown(
+    ui(
         f"""
-        <div class="empty">
+        <div class="empty-card">
             <div class="empty-icon">
                 {icon}
             </div>
@@ -1736,8 +2728,7 @@ def render_empty(
                 {h(copy)}
             </span>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
@@ -1748,15 +2739,16 @@ def render_bottom_nav() -> None:
         key=NAV_KEY,
         horizontal=True,
         label_visibility="collapsed",
-        width="stretch",
     )
 
 
 # -----------------------------------------------------------------------------
 # 홈 화면
 # -----------------------------------------------------------------------------
-def page_home(places: pd.DataFrame) -> None:
-    st.markdown(
+def page_home(
+    places: pd.DataFrame,
+) -> None:
+    ui(
         """
         <div class="hero">
             <div class="hero-chip">
@@ -1769,63 +2761,139 @@ def page_home(places: pd.DataFrame) -> None:
             </div>
 
             <p class="hero-copy">
-                대기시간과 취향을 고르면 주변 장소를 이어 만든
-                코스를 바로 제안합니다.
+                대기시간과 취향을 고르면
+                주변 장소를 엮은 맞춤 코스를 제안해요.
             </p>
+
+            <div class="hero-orbit">
+                🧭
+            </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
-    st.markdown(
+    ui(
         f"""
-        <div class="stats">
-            <div class="stat">
-                <strong>{len(places)}</strong>
-                <span>등록 장소</span>
+        <div class="stats-grid">
+            <div class="stat-card">
+                <strong>
+                    {len(places)}
+                </strong>
+
+                <span>
+                    등록 장소
+                </span>
             </div>
 
-            <div class="stat">
-                <strong>{places["지역"].nunique()}</strong>
-                <span>서비스 지역</span>
+            <div class="stat-card">
+                <strong>
+                    {places["지역"].nunique()}
+                </strong>
+
+                <span>
+                    서비스 지역
+                </span>
             </div>
 
-            <div class="stat">
-                <strong>{len(st.session_state.checkins)}</strong>
-                <span>내 체크인</span>
+            <div class="stat-card">
+                <strong>
+                    {len(st.session_state.checkins)}
+                </strong>
+
+                <span>
+                    내 체크인
+                </span>
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
+
+    status = get_gemini_status()
+
+    if status["configured"]:
+        ui(
+            """
+            <div class="ai-ready">
+                <div class="ai-symbol">
+                    ✦
+                </div>
+
+                <div class="ai-copy">
+                    <strong>
+                        AI 맞춤 추천 준비 완료
+                    </strong>
+
+                    <span>
+                        선택한 지역의 CSV 장소만 이용해
+                        코스를 만들어요.
+                    </span>
+                </div>
+
+                <div class="ai-check">
+                    ✓
+                </div>
+            </div>
+            """
+        )
+
+    else:
+        ui(
+            """
+            <div class="ai-proof fallback">
+                <div class="ai-symbol">
+                    !
+                </div>
+
+                <div class="ai-copy">
+                    <strong>
+                        AI 키를 확인해 주세요
+                    </strong>
+
+                    <span>
+                        키가 없어도 기본 추천으로
+                        앱은 계속 동작해요.
+                    </span>
+                </div>
+            </div>
+            """
+        )
 
     render_section(
         "오늘의 대기 코스 만들기",
-        "START",
-        "CSV 기반 추천",
+        "PERSONAL ROUTE",
+        "취향 맞춤",
     )
 
-    restaurants_df = places[
-        places["카테고리"] == "맛집"
+    restaurants = places[
+        places["카테고리"]
+        == "맛집"
     ]
 
     regions = sorted(
-        restaurants_df[
+        restaurants[
             "지역"
-        ].dropna().unique().tolist()
+        ]
+        .dropna()
+        .unique()
+        .tolist()
     )
 
     if not regions:
         st.warning(
             "CSV에 `맛집` 카테고리가 없습니다."
         )
+
         return
 
     if (
-        st.session_state.get("home_region")
+        st.session_state.get(
+            "home_region"
+        )
         not in regions
     ):
-        st.session_state.home_region = regions[0]
+        st.session_state.home_region = (
+            regions[0]
+        )
 
     region = st.selectbox(
         "지역",
@@ -1833,18 +2901,25 @@ def page_home(places: pd.DataFrame) -> None:
         key="home_region",
     )
 
-    restaurant_names = restaurants_df[
-        restaurants_df["지역"] == region
-    ]["이름"].tolist()
+    restaurant_names = (
+        restaurants[
+            restaurants["지역"]
+            == region
+        ]["이름"]
+        .tolist()
+    )
 
     if not restaurant_names:
         st.warning(
-            "선택 지역에 맛집 데이터가 없습니다."
+            "선택한 지역에 맛집이 없습니다."
         )
+
         return
 
     if (
-        st.session_state.get("home_restaurant")
+        st.session_state.get(
+            "home_restaurant"
+        )
         not in restaurant_names
     ):
         st.session_state.home_restaurant = (
@@ -1857,16 +2932,26 @@ def page_home(places: pd.DataFrame) -> None:
         key="home_restaurant",
     )
 
-    st.radio(
+    companion = st.radio(
         "동행 유형",
-        ("혼자", "연인", "가족", "친구"),
+        (
+            "혼자",
+            "연인",
+            "가족",
+            "친구",
+        ),
         horizontal=True,
         key="home_companion",
     )
 
-    st.radio(
+    meal = st.radio(
         "식사 시간",
-        ("점심", "오후", "저녁", "야간"),
+        (
+            "점심",
+            "오후",
+            "저녁",
+            "야간",
+        ),
         horizontal=True,
         key="home_meal",
     )
@@ -1882,13 +2967,18 @@ def page_home(places: pd.DataFrame) -> None:
             120,
         ),
         value=60,
-        format_func=lambda value: f"{value}분",
+        format_func=(
+            lambda value:
+            f"{value}분"
+        ),
         key="home_wait",
     )
 
     interests = st.multiselect(
         "관심 분야",
-        tuple(INTEREST_CATEGORY),
+        tuple(
+            INTEREST_CATEGORY
+        ),
         default=(
             "자연·산책",
             "카페·디저트",
@@ -1897,168 +2987,160 @@ def page_home(places: pd.DataFrame) -> None:
     )
 
     if st.button(
-        "✨ 내 대기 코스 만들기",
+        "✨ AI 맞춤 코스 만들기",
         type="primary",
         width="stretch",
         key="make_route",
     ):
         preferences = {
             "region": region,
-            "companion": (
-                st.session_state.home_companion
-            ),
-            "meal": st.session_state.home_meal,
+            "companion": companion,
+            "meal": meal,
             "wait": int(wait),
-            "interests": list(interests),
+            "interests": list(
+                interests
+            ),
         }
 
-        routes = build_routes(
-            places,
-            restaurant,
-            preferences,
-        )
+        with st.spinner(
+            "AI가 취향에 맞는 "
+            "코스를 만들고 있어요..."
+        ):
+            routes, meta = (
+                create_recommendations(
+                    places,
+                    restaurant,
+                    preferences,
+                    variation=0,
+                )
+            )
 
         if not routes:
             st.warning(
-                "이 지역에는 코스를 만들 주변 장소가 부족합니다."
+                "이 지역에는 코스를 만들 "
+                "주변 장소가 부족합니다."
             )
 
-        else:
-            st.session_state.preferences = (
-                preferences
-            )
+            return
 
-            st.session_state.selected_restaurant = (
-                restaurant
-            )
+        st.session_state.preferences = (
+            preferences
+        )
 
-            st.session_state.routes = routes
-            st.session_state.route_index = 0
-            st.session_state.route_nonce = 0
+        st.session_state.selected_restaurant = (
+            restaurant
+        )
 
-            st.session_state.queue = create_queue(
+        st.session_state.routes = routes
+        st.session_state.route_index = 0
+        st.session_state.route_variation = 0
+        st.session_state.route_generation += 1
+        st.session_state.ai_meta = meta
+
+        st.session_state.queue = (
+            create_queue(
                 region,
                 restaurant,
                 int(wait),
             )
+        )
 
-            st.session_state.pop(
-                "route_picker",
-                None,
+        if meta["source"] == "gemini":
+            st.toast(
+                "AI 맞춤 코스가 완성됐어요.",
+                icon="✨",
             )
 
-            go(COURSE)
+        else:
+            st.toast(
+                "기본 추천 코스로 먼저 안내할게요.",
+                icon="🧭",
+            )
 
-    st.markdown(
+        go(COURSE)
+
+    ui(
         """
-        <div class="mission">
-            <small>DEMO FLOW</small>
+        <div class="reward-card">
+            <small>
+                WAITGO EXPERIENCE
+            </small>
 
             <strong>
-                코스 생성 → 일정 저장 → 카메라 체크인 → 100P 적립
+                코스 선택 → 일정 저장 →
+                현장 체크인 → 포인트 적립
             </strong>
 
             <span>
-                지도 거리와 GPT 설명은 다음 단계에서 연결합니다.
+                맛집 대기시간을 주변 상권과
+                관광 경험으로 연결해요.
             </span>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
-
-    if st.session_state.routes:
-        route = active_route()
-
-        if route:
-            render_section(
-                "최근 만든 코스",
-                "RECENT",
-            )
-
-            st.markdown(
-                f"""
-                <div class="card">
-                    <div class="place-kind">
-                        {h(route["region"])}
-                        ·
-                        {h(route["badge"])}
-                    </div>
-
-                    <div class="place-name">
-                        {h(route["title"])}
-                    </div>
-
-                    <div class="place-address">
-                        {h(route["restaurant"])}
-                        중심 ·
-                        {len(route["stops"])}개 장소
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            if st.button(
-                "최근 코스 다시 보기",
-                width="stretch",
-                key="open_recent",
-            ):
-                go(COURSE)
 
 
 # -----------------------------------------------------------------------------
-# 대기 현황 카드
+# 코스 화면
 # -----------------------------------------------------------------------------
 def render_queue_card() -> None:
     if not st.session_state.queue:
         return
 
-    remaining, progress, teams = (
-        queue_status()
-    )
-
-    if remaining == 0:
-        status = "입장 가능"
-        teams_text = "지금 입장해 주세요"
-    else:
-        status = f"{remaining}분 남음"
-        teams_text = f"앞에 약 {teams}팀"
+    (
+        remaining,
+        progress,
+        teams,
+    ) = queue_status()
 
     queue = st.session_state.queue
 
-    st.markdown(
+    status = (
+        "입장 가능"
+        if remaining == 0
+        else f"{remaining}분 남음"
+    )
+
+    team_text = (
+        "지금 입장해 주세요"
+        if remaining == 0
+        else f"앞에 약 {teams}팀"
+    )
+
+    ui(
         f"""
-        <div class="queue">
+        <div class="queue-card">
             <div class="queue-top">
                 <div>
-                    <div class="q-ticket">
-                        대기번호 {h(queue["ticket"])}
+                    <div class="queue-ticket">
+                        대기번호
+                        {h(queue["ticket"])}
                     </div>
 
-                    <div class="q-name">
+                    <div class="queue-name">
                         {h(queue["restaurant"])}
                     </div>
                 </div>
 
-                <div class="q-right">
+                <div class="queue-right">
                     <strong>
                         {h(status)}
                     </strong>
 
                     <span>
-                        {h(teams_text)}
+                        {h(team_text)}
                     </span>
                 </div>
             </div>
 
-            <div class="track">
+            <div class="progress-track">
                 <div
-                    class="bar"
+                    class="progress-bar"
                     style="width: {progress}%"
                 ></div>
             </div>
 
-            <div class="q-bottom">
+            <div class="queue-bottom">
                 <span>
                     대기 진행률 {progress}%
                 </span>
@@ -2068,8 +3150,7 @@ def render_queue_card() -> None:
                 </span>
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
     left, right = st.columns(2)
@@ -2095,104 +3176,211 @@ def render_queue_card() -> None:
             st.rerun()
 
 
-# -----------------------------------------------------------------------------
-# 코스 장소 카드
-# -----------------------------------------------------------------------------
-def render_route_stop(
+def render_ai_proof() -> None:
+    """
+    실제 Gemini 호출이 적용됐는지
+    코스 화면에서 바로 보여준다.
+    """
+    meta = st.session_state.ai_meta
+
+    if (
+        meta.get("source")
+        == "gemini"
+    ):
+        latency = float(
+            meta.get(
+                "latency_seconds",
+                0.0,
+            )
+        )
+
+        repair_count = int(
+            meta.get(
+                "repair_count",
+                0,
+            )
+        )
+
+        detail = (
+            f"Gemini 응답 {latency:.1f}초 "
+            "· CSV 장소 검증 완료"
+        )
+
+        if repair_count:
+            detail += (
+                f" · {repair_count}건 자동 보정"
+            )
+
+        ui(
+            f"""
+            <div class="ai-proof">
+                <div class="ai-symbol">
+                    ✦
+                </div>
+
+                <div class="ai-copy">
+                    <strong>
+                        AI 맞춤 추천이 적용됐어요
+                    </strong>
+
+                    <span>
+                        {h(detail)}
+                    </span>
+                </div>
+
+                <div class="ai-check">
+                    ✓
+                </div>
+            </div>
+            """
+        )
+
+    else:
+        ui(
+            """
+            <div class="ai-proof fallback">
+                <div class="ai-symbol">
+                    ↻
+                </div>
+
+                <div class="ai-copy">
+                    <strong>
+                        기본 추천으로 안내 중이에요
+                    </strong>
+
+                    <span>
+                        AI 연결이 지연돼도
+                        코스 기능은 계속 사용할 수 있어요.
+                    </span>
+                </div>
+            </div>
+            """
+        )
+
+
+def render_stop(
     stop: dict[str, Any],
+    index: int,
+    total: int,
 ) -> None:
+    """
+    코스 장소를 타임라인 카드로 표시한다.
+    """
     category = stop["category"]
+
+    css_class = CATEGORY_CLASS.get(
+        category,
+        "nature",
+    )
 
     icon = CATEGORY_ICON.get(
         category,
         "📍",
     )
 
-    map_query = quote_plus(
-        f"{stop['name']} {stop['address']}"
+    query = quote_plus(
+        (
+            f"{stop['name']} "
+            f"{stop['address']}"
+        )
     )
 
     tags = str(
-        stop.get("tags", "")
+        stop.get(
+            "tags",
+            "",
+        )
     ).strip()
 
     if tags:
-        tags_html = (
-            '<div class="stop-tags">'
+        tag_html = (
+            '<span class="tag-text">'
             f'#{h(tags).replace(" ", " #")}'
-            "</div>"
+            "</span>"
         )
-    else:
-        tags_html = ""
 
-    st.markdown(
+    else:
+        tag_html = "<span></span>"
+
+    line_html = (
+        '<div class="step-line"></div>'
+        if index < total
+        else ""
+    )
+
+    ui(
         f"""
-        <div class="stop">
-            <div class="stop-icon">
-                {icon}
+        <div class="timeline-row">
+            <div class="timeline-rail">
+                <div class="step-dot {css_class}">
+                    {icon}
+                </div>
+
+                {line_html}
             </div>
 
-            <div class="stop-body">
-                <div class="stop-top">
-                    <div class="stop-phase">
+            <div class="place-card">
+                <div class="place-top">
+                    <span class="phase-chip {css_class}">
                         {h(stop["phase"])}
                         ·
                         {h(category)}
-                    </div>
+                    </span>
 
-                    <div class="stop-time">
+                    <span class="place-time">
                         {h(stop["time"])}
                         ·
-                        {stop["duration"]}분
-                    </div>
+                        권장 {stop["duration"]}분
+                    </span>
                 </div>
 
-                <div class="stop-name">
+                <div class="place-name">
                     {h(stop["name"])}
                 </div>
 
-                <div class="stop-reason">
+                <div class="place-reason">
                     {h(stop["reason"])}
                 </div>
 
-                <div class="stop-address">
-                    {h(stop["address"])}
+                <div class="place-address">
+                    📍
+                    {h(short_address(stop["address"]))}
                 </div>
 
-                {tags_html}
+                <div class="place-footer">
+                    {tag_html}
 
-                <a
-                    class="map"
-                    href="https://www.google.com/maps/search/?api=1&query={map_query}"
-                    target="_blank"
-                >
-                    지도에서 검색 ↗
-                </a>
+                    <a
+                        class="map-link"
+                        href="https://www.google.com/maps/search/?api=1&query={query}"
+                        target="_blank"
+                    >
+                        지도 검색 ↗
+                    </a>
+                </div>
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
-# -----------------------------------------------------------------------------
-# 코스 화면
-# -----------------------------------------------------------------------------
 def page_course(
     places: pd.DataFrame,
 ) -> None:
     if not st.session_state.routes:
         render_empty(
             "🧭",
-            "아직 만든 코스가 없습니다",
-            "홈에서 맛집과 대기시간을 선택해 주세요.",
+            "아직 만든 코스가 없어요",
+            (
+                "홈에서 맛집과 "
+                "대기시간을 선택해 주세요."
+            ),
         )
 
         if st.button(
             "홈에서 코스 만들기",
             type="primary",
             width="stretch",
-            key="course_home",
         ):
             go(HOME)
 
@@ -2201,69 +3389,74 @@ def page_course(
     render_section(
         "현재 대기 현황",
         "QUEUE",
-        "시연 조작 가능",
+        "기다림을 여행으로",
     )
 
     render_queue_card()
+    render_ai_proof()
 
     render_section(
-        "추천 코스 3안",
-        "ROUTE",
-        "한 가지를 선택하세요",
+        "추천 코스",
+        "CURATED ROUTES",
+        "세 가지 조합",
     )
 
-    titles = [
-        route["title"]
-        for route in st.session_state.routes
-    ]
-
-    if (
-        st.session_state.get("route_picker")
-        not in titles
-    ):
-        st.session_state.route_picker = (
-            titles[0]
+    route_labels = tuple(
+        f"코스 {index + 1}"
+        for index in range(
+            len(
+                st.session_state.routes
+            )
         )
+    )
 
-    selected = st.radio(
-        "추천안",
-        titles,
+    radio_key = (
+        "route_choice_"
+        f"{st.session_state.route_generation}"
+    )
+
+    selected_label = st.radio(
+        "추천 코스 선택",
+        route_labels,
+        index=min(
+            st.session_state.route_index,
+            len(route_labels) - 1,
+        ),
         horizontal=True,
         label_visibility="collapsed",
-        key="route_picker",
-        width="stretch",
+        key=radio_key,
     )
 
     st.session_state.route_index = (
-        titles.index(selected)
+        route_labels.index(
+            selected_label
+        )
     )
 
     route = active_route()
 
     if route is None:
-        st.warning(
-            "추천 코스를 불러오지 못했습니다."
-        )
         return
 
-    st.markdown(
+    ui(
         f"""
-        <div class="route">
-            <div class="badge">
+        <div class="route-hero">
+            <div class="route-badge">
                 {h(route["badge"])}
-                · 지역 기준 추천
+                ·
+                {h(route["region"])}
             </div>
 
-            <h3>
+            <div class="route-title">
                 {h(route["title"])}
-            </h3>
+            </div>
 
-            <p>
-                {h(route["description"])}
+            <p class="route-summary">
+                {h(route["summary"])}
             </p>
 
             <div class="route-meta">
-                <div>
+                <div class="route-meta-item">
                     <strong>
                         {len(route["stops"])}곳
                     </strong>
@@ -2273,17 +3466,17 @@ def page_course(
                     </span>
                 </div>
 
-                <div>
+                <div class="route-meta-item">
                     <strong>
-                        {format_minutes(route["local_stay"])}
+                        {h(format_minutes(route["local_stay"]))}
                     </strong>
 
                     <span>
-                        지역 체류
+                        권장 지역 체류
                     </span>
                 </div>
 
-                <div>
+                <div class="route-meta-item">
                     <strong>
                         {h(route["companion"])}
                     </strong>
@@ -2294,47 +3487,49 @@ def page_course(
                 </div>
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        '<div class="timeline">',
-        unsafe_allow_html=True,
-    )
-
-    for stop in route["stops"]:
-        render_route_stop(stop)
-
-    st.markdown(
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
         """
-        <div class="mission">
-            <small>WAITGO MISSION</small>
+    )
+
+    for (
+        index,
+        stop,
+    ) in enumerate(
+        route["stops"],
+        start=1,
+    ):
+        render_stop(
+            stop,
+            index,
+            len(route["stops"]),
+        )
+
+    ui(
+        """
+        <div class="reward-card">
+            <small>
+                CHECK-IN REWARD
+            </small>
 
             <strong>
-                추천 장소에서 사진 체크인하면 +100P
+                추천 장소에서 사진 체크인하면
+                +100P
             </strong>
 
             <span>
-                노트북 기본 카메라로 촬영 후 체크인을 확정합니다.
+                노트북 기본 카메라로
+                방문을 기록해 보세요.
             </span>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
-    saved_ids = {
-        item["id"]
-        for item in st.session_state.saved
-    }
-
-    already_saved = (
-        route["id"] in saved_ids
+    is_saved = (
+        route["id"]
+        in {
+            item["id"]
+            for item
+            in st.session_state.saved
+        }
     )
 
     left, right = st.columns(2)
@@ -2343,12 +3538,12 @@ def page_course(
         if st.button(
             (
                 "✓ 저장됨"
-                if already_saved
+                if is_saved
                 else "＋ MY에 담기"
             ),
-            disabled=already_saved,
+            disabled=is_saved,
             width="stretch",
-            key="save_route",
+            key="save_current_route",
         ):
             save_active_route()
             st.rerun()
@@ -2358,39 +3553,64 @@ def page_course(
             "📷 체크인",
             type="primary",
             width="stretch",
-            key="to_checkin",
+            key="go_checkin",
         ):
             go(CHECKIN)
 
     if st.button(
         "🔄 같은 조건으로 다시 추천",
         width="stretch",
-        key="regenerate",
+        key="regenerate_route",
     ):
-        st.session_state.route_nonce += 1
+        st.session_state.route_variation += 1
 
-        st.session_state.routes = (
-            build_routes(
-                places,
-                st.session_state.selected_restaurant,
-                st.session_state.preferences,
-                st.session_state.route_nonce,
+        with st.spinner(
+            "AI가 새로운 장소 조합을 "
+            "만들고 있어요..."
+        ):
+            routes, meta = (
+                create_recommendations(
+                    places,
+                    st.session_state
+                    .selected_restaurant,
+                    st.session_state
+                    .preferences,
+                    st.session_state
+                    .route_variation,
+                )
             )
-        )
 
-        st.session_state.route_index = 0
+        if routes:
+            st.session_state.routes = routes
+            st.session_state.route_index = 0
+            st.session_state.route_generation += 1
+            st.session_state.ai_meta = meta
+            st.rerun()
 
-        st.session_state.pop(
-            "route_picker",
-            None,
-        )
+        else:
+            st.warning(
+                "새로운 코스를 만들지 못했습니다."
+            )
 
-        st.toast(
-            "새로운 조합을 만들었습니다.",
-            icon="🔄",
-        )
-
-        st.rerun()
+    # Gemini 실패 때만 오류 확인 메뉴가 나타난다.
+    if (
+        st.session_state
+        .ai_meta
+        .get("source")
+        == "python"
+    ):
+        with st.expander(
+            "AI 연결 오류 확인"
+        ):
+            st.code(
+                st.session_state
+                .ai_meta
+                .get(
+                    "error",
+                    "오류 정보 없음",
+                ),
+                language=None,
+            )
 
 
 # -----------------------------------------------------------------------------
@@ -2399,21 +3619,28 @@ def page_course(
 def page_checkin() -> None:
     route = active_route()
 
-    if route is None and st.session_state.saved:
-        route = st.session_state.saved[0]
+    if (
+        route is None
+        and st.session_state.saved
+    ):
+        route = (
+            st.session_state.saved[0]
+        )
 
     if route is None:
         render_empty(
             "📷",
-            "체크인할 코스가 없습니다",
-            "먼저 홈에서 코스를 만들어 주세요.",
+            "체크인할 코스가 없어요",
+            (
+                "먼저 홈에서 "
+                "코스를 만들어 주세요."
+            ),
         )
 
         if st.button(
             "홈으로 이동",
             type="primary",
             width="stretch",
-            key="checkin_home",
         ):
             go(HOME)
 
@@ -2425,15 +3652,15 @@ def page_checkin() -> None:
         "+100P · 장소별 1회",
     )
 
-    stops = route["stops"]
-
     names = [
         stop["name"]
-        for stop in stops
+        for stop in route["stops"]
     ]
 
     if (
-        st.session_state.get("checkin_place")
+        st.session_state.get(
+            "checkin_place"
+        )
         not in names
     ):
         st.session_state.checkin_place = (
@@ -2448,8 +3675,11 @@ def page_checkin() -> None:
 
     stop = next(
         item
-        for item in stops
-        if item["name"] == selected_name
+        for item in route["stops"]
+        if (
+            item["name"]
+            == selected_name
+        )
     )
 
     checkin_id = sha1(
@@ -2461,55 +3691,61 @@ def page_checkin() -> None:
 
     already_checked = any(
         item["id"] == checkin_id
-        for item in st.session_state.checkins
+        for item
+        in st.session_state.checkins
     )
 
-    if already_checked:
-        done_html = """
-        <div class="done">
+    done_html = (
+        """
+        <div class="done-pill">
             ✓ 체크인 완료 · 포인트 지급 완료
         </div>
         """
-    else:
-        done_html = ""
+        if already_checked
+        else ""
+    )
 
-    st.markdown(
+    ui(
         f"""
-        <div class="card">
-            <div class="place-kind">
-                {CATEGORY_ICON.get(stop["category"], "📍")}
+        <div class="simple-card">
+            <div class="card-kicker">
+                {
+                    CATEGORY_ICON.get(
+                        stop["category"],
+                        "📍",
+                    )
+                }
                 {h(stop["category"])}
             </div>
 
-            <div class="place-name">
+            <div class="card-title">
                 {h(stop["name"])}
             </div>
 
-            <div class="place-address">
-                {h(stop["address"])}
+            <div class="card-copy">
+                📍
+                {h(short_address(stop["address"]))}
             </div>
 
             {done_html}
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
     st.info(
-        "브라우저에서 카메라 권한을 허용한 뒤 촬영해 주세요."
+        "브라우저에서 카메라 권한을 "
+        "허용한 뒤 촬영해 주세요."
     )
 
     picture = st.camera_input(
         "체크인 사진",
         key=f"camera_{checkin_id}",
-        resolution="720p",
-        width="stretch",
     )
 
     if picture is not None:
         if st.button(
             (
-                "이미 체크인한 장소입니다"
+                "이미 체크인한 장소예요"
                 if already_checked
                 else "체크인 확정 +100P"
             ),
@@ -2518,47 +3754,40 @@ def page_checkin() -> None:
             width="stretch",
             key=f"confirm_{checkin_id}",
         ):
-            record = {
-                "id": checkin_id,
-                "name": stop["name"],
-                "category": stop["category"],
-                "checked_at": (
-                    datetime.now().strftime(
-                        "%m.%d %H:%M"
-                    )
-                ),
-                "points": 100,
-                "image_hash": sha256(
-                    picture.getvalue()
-                ).hexdigest()[:12],
-            }
-
             st.session_state.checkins.insert(
                 0,
-                record,
+                {
+                    "id": checkin_id,
+                    "name": stop["name"],
+                    "category": (
+                        stop["category"]
+                    ),
+                    "checked_at": (
+                        datetime.now().strftime(
+                            "%m.%d %H:%M"
+                        )
+                    ),
+                    "points": 100,
+                    "image_hash": sha256(
+                        picture.getvalue()
+                    ).hexdigest()[:12],
+                },
             )
 
             st.session_state.points += 100
 
             st.toast(
-                "체크인 성공! 100P를 적립했습니다.",
+                (
+                    "체크인 성공! "
+                    "100P를 적립했어요."
+                ),
                 icon="🎉",
             )
 
             st.rerun()
 
-    st.markdown(
-        """
-        <div class="note">
-            사진 원본은 파일이나 CSV에 저장하지 않고
-            현재 세션의 체크인 확인에만 사용합니다.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
     render_section(
-        "오늘의 미션",
+        "오늘의 방문 미션",
         "PROGRESS",
     )
 
@@ -2568,33 +3797,36 @@ def page_checkin() -> None:
 
     percent = min(
         100,
-        int(completed / 3 * 100),
+        int(
+            completed
+            / 3
+            * 100
+        ),
     )
 
-    st.markdown(
+    ui(
         f"""
-        <div class="card">
-            <div class="place-kind">
+        <div class="simple-card">
+            <div class="card-kicker">
                 지역 체류 미션
             </div>
 
-            <div class="place-name">
+            <div class="card-title">
                 {completed}/3곳 체크인 완료
             </div>
 
-            <div class="track">
+            <div class="progress-track">
                 <div
-                    class="bar"
+                    class="progress-bar"
                     style="width: {percent}%"
                 ></div>
             </div>
 
-            <div class="place-address">
+            <div class="card-copy">
                 3곳 방문 시 총 300P
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
@@ -2607,18 +3839,22 @@ def page_my(
     render_section(
         "나의 대기여행",
         "MY WAITGO",
-        "현재 세션 기록",
+        "일정과 포인트",
     )
 
-    local_stay = sum(
-        route.get("local_stay", 0)
-        for route in st.session_state.saved
+    total_stay = sum(
+        route.get(
+            "local_stay",
+            0,
+        )
+        for route
+        in st.session_state.saved
     )
 
-    st.markdown(
+    ui(
         f"""
-        <div class="stats">
-            <div class="stat">
+        <div class="stats-grid">
+            <div class="stat-card">
                 <strong>
                     {st.session_state.points:,}P
                 </strong>
@@ -2628,7 +3864,7 @@ def page_my(
                 </span>
             </div>
 
-            <div class="stat">
+            <div class="stat-card">
                 <strong>
                     {len(st.session_state.saved)}
                 </strong>
@@ -2638,18 +3874,17 @@ def page_my(
                 </span>
             </div>
 
-            <div class="stat">
+            <div class="stat-card">
                 <strong>
-                    {format_minutes(local_stay)}
+                    {h(format_minutes(total_stay))}
                 </strong>
 
                 <span>
-                    지역 체류
+                    권장 체류
                 </span>
             </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
     render_section(
@@ -2661,28 +3896,34 @@ def page_my(
     if not st.session_state.saved:
         render_empty(
             "🗂️",
-            "저장한 코스가 없습니다",
-            "추천 코스에서 MY에 담기를 눌러보세요.",
+            "저장한 코스가 없어요",
+            (
+                "추천 코스에서 "
+                "MY에 담기를 눌러보세요."
+            ),
         )
 
     else:
-        saved_copy = list(
-            st.session_state.saved
-        )
-
-        for index, route in enumerate(saved_copy):
-            st.markdown(
+        for (
+            index,
+            route,
+        ) in enumerate(
+            list(
+                st.session_state.saved
+            )
+        ):
+            ui(
                 f"""
-                <div class="saved">
-                    <div class="saved-top">
+                <div class="saved-card">
+                    <div class="saved-head">
                         <div>
-                            <div class="place-kind">
+                            <div class="card-kicker">
                                 {h(route["region"])}
                                 ·
                                 {h(route["badge"])}
                             </div>
 
-                            <div class="saved-title">
+                            <div class="card-title">
                                 {h(route["title"])}
                             </div>
                         </div>
@@ -2692,19 +3933,21 @@ def page_my(
                         </div>
                     </div>
 
-                    <div class="saved-copy">
+                    <div class="card-copy">
                         {h(route["restaurant"])}
                         중심 ·
                         {len(route["stops"])}개 장소 ·
-                        {format_minutes(route["local_stay"])}
+                        {h(format_minutes(route["local_stay"]))}
                     </div>
                 </div>
-                """,
-                unsafe_allow_html=True,
+                """
             )
 
             left, right = st.columns(
-                [2, 1]
+                [
+                    2,
+                    1,
+                ]
             )
 
             with left:
@@ -2722,20 +3965,28 @@ def page_my(
                     ]
 
                     st.session_state.route_index = 0
+                    st.session_state.route_generation += 1
 
                     st.session_state.selected_restaurant = (
                         route["restaurant"]
                     )
 
                     st.session_state.preferences = {
-                        "region": route["region"],
-                        "companion": route["companion"],
+                        "region": (
+                            route["region"]
+                        ),
+                        "companion": (
+                            route["companion"]
+                        ),
                         "meal": route.get(
                             "meal",
                             "점심",
                         ),
                         "wait": int(
-                            route.get("wait", 60)
+                            route.get(
+                                "wait",
+                                60,
+                            )
                         ),
                         "interests": list(
                             route.get(
@@ -2758,10 +4009,18 @@ def page_my(
                         )
                     )
 
-                    st.session_state.pop(
-                        "route_picker",
-                        None,
-                    )
+                    st.session_state.ai_meta = {
+                        "source": route.get(
+                            "source",
+                            "python",
+                        ),
+                        "model": "",
+                        "latency_seconds": 0.0,
+                        "interaction_id": "",
+                        "repair_count": 0,
+                        "warnings": [],
+                        "error": "",
+                    }
 
                     go(COURSE)
 
@@ -2777,8 +4036,12 @@ def page_my(
                 ):
                     st.session_state.saved = [
                         item
-                        for item in st.session_state.saved
-                        if item["id"] != route["id"]
+                        for item
+                        in st.session_state.saved
+                        if (
+                            item["id"]
+                            != route["id"]
+                        )
                     ]
 
                     st.rerun()
@@ -2792,16 +4055,21 @@ def page_my(
     if not st.session_state.checkins:
         render_empty(
             "📍",
-            "체크인 기록이 없습니다",
-            "추천 장소에서 카메라 체크인을 해보세요.",
+            "체크인 기록이 없어요",
+            (
+                "추천 장소에서 "
+                "카메라 체크인을 해보세요."
+            ),
         )
 
     else:
-        history_rows = ""
+        rows = ""
 
-        for record in st.session_state.checkins:
-            history_rows += f"""
-            <div class="history">
+        for record in (
+            st.session_state.checkins
+        ):
+            rows += f"""
+            <div class="history-row">
                 <div>
                     <div class="history-name">
                         {
@@ -2818,75 +4086,98 @@ def page_my(
                     </div>
                 </div>
 
-                <div class="history-points">
+                <div class="history-point">
                     +{record["points"]}P
                 </div>
             </div>
             """
 
-        st.markdown(
+        ui(
             f"""
-            <div class="card">
-                {history_rows}
+            <div class="simple-card">
+                {rows}
             </div>
-            """,
-            unsafe_allow_html=True,
+            """
         )
 
     render_section(
-        "앱·데이터 확인",
-        "SYSTEM",
+        "연결 상태",
+        "DEVELOPER CHECK",
+        "시연 준비 확인",
     )
 
+    status = get_gemini_status()
+    meta = st.session_state.ai_meta
+
     with st.expander(
-        "현재 실행 중인 main.py 확인"
+        "AI 및 데이터 상태 보기"
     ):
         st.write(
-            f"**빌드:** `{BUILD}`"
-        )
-
-        st.write(
-            f"**실행 파일:** `{Path(__file__).resolve()}`"
-        )
-
-        st.write(
-            f"**CSV:** `{DATA_PATH.resolve()}`"
-        )
-
-        st.write(
-            f"**장소 수:** `{len(places)}개`"
-        )
-
-        visible_columns = [
-            column
-            for column in (
-                "지역",
-                "카테고리",
-                "이름",
-                "주소",
+            "**Gemini 키:** "
+            + (
+                "설정됨"
+                if status["configured"]
+                else "키 없음"
             )
-            if column in places.columns
-        ]
-
-        st.dataframe(
-            places[visible_columns],
-            width="stretch",
-            hide_index=True,
-            height=230,
         )
+
+        st.write(
+            "**사용 모델:** "
+            f"`{status['model']}`"
+        )
+
+        st.write(
+            "**CSV 장소 수:** "
+            f"`{len(places)}개`"
+        )
+
+        if meta.get("source"):
+            recent_source = (
+                "`Gemini API`"
+                if (
+                    meta["source"]
+                    == "gemini"
+                )
+                else "`Python 기본 추천`"
+            )
+
+            st.write(
+                "**최근 추천 방식:** "
+                + recent_source
+            )
+
+        if meta.get(
+            "latency_seconds"
+        ):
+            st.write(
+                "**AI 응답시간:** "
+                f"`{meta['latency_seconds']:.2f}초`"
+            )
+
+        if meta.get(
+            "interaction_id"
+        ):
+            st.write(
+                "**Interaction ID:** "
+                f"`{meta['interaction_id']}`"
+            )
+
+        if meta.get("error"):
+            st.caption(
+                "최근 AI 오류"
+            )
+
+            st.code(
+                meta["error"],
+                language=None,
+            )
 
         if st.button(
             "CSV 캐시 비우고 다시 읽기",
             width="stretch",
-            key="reload_csv",
         ):
             st.cache_data.clear()
             st.rerun()
-
-    st.markdown(
-        '<div class="divider"></div>',
-        unsafe_allow_html=True,
-    )
 
     if st.button(
         "시연 기록 전체 초기화",
@@ -2894,11 +4185,10 @@ def page_my(
         key="reset_demo",
     ):
         reset_demo()
-        st.rerun()
 
 
 # -----------------------------------------------------------------------------
-# 앱 실행
+# 실행
 # -----------------------------------------------------------------------------
 def main() -> None:
     inject_css()
@@ -2908,17 +4198,17 @@ def main() -> None:
 
     render_header()
 
-    current_page = st.session_state[
+    page = st.session_state[
         NAV_KEY
     ]
 
-    if current_page == HOME:
+    if page == HOME:
         page_home(places)
 
-    elif current_page == COURSE:
+    elif page == COURSE:
         page_course(places)
 
-    elif current_page == CHECKIN:
+    elif page == CHECKIN:
         page_checkin()
 
     else:
