@@ -4,6 +4,8 @@ import json
 import os
 import re
 import time
+
+import requests
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -19,9 +21,10 @@ SECRETS_PATH = BASE_DIR / ".streamlit" / "secrets.toml"
 DEFAULT_MODEL = "gemini-3.6-flash"
 DEFAULT_TIMEOUT_SECONDS = 45
 DEFAULT_RETRY_TIMEOUT_SECONDS = 30
-DEFAULT_OPENAI_MODEL = "gpt-5.6-terra"
-DEFAULT_OPENAI_TIMEOUT_SECONDS = 60
-DEFAULT_OPENAI_REASONING_EFFORT = "low"
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
+DEFAULT_GROQ_TIMEOUT_SECONDS = 45
+DEFAULT_GROQ_REASONING_EFFORT = "low"
+GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
 MAX_CANDIDATES = 12
 MAX_AI_PLACES = 4
 
@@ -67,10 +70,10 @@ def _read_streamlit_secrets() -> dict[str, Any]:
             "GEMINI_MODEL",
             "AI_TIMEOUT_SECONDS",
             "AI_RETRY_TIMEOUT_SECONDS",
-            "OPENAI_API_KEY",
-            "OPENAI_MODEL",
-            "OPENAI_TIMEOUT_SECONDS",
-            "OPENAI_REASONING_EFFORT",
+            "GROQ_API_KEY",
+            "GROQ_MODEL",
+            "GROQ_TIMEOUT_SECONDS",
+            "GROQ_REASONING_EFFORT",
         ):
             try:
                 if key in st.secrets:
@@ -138,43 +141,43 @@ def get_gemini_status() -> dict[str, Any]:
     }
 
 
-def load_openai_settings() -> dict[str, Any]:
-    """OpenAI API 설정을 읽습니다."""
+def load_groq_settings() -> dict[str, Any]:
+    """Groq API 설정을 읽습니다."""
     values = _read_local_secrets()
     for key, value in _read_streamlit_secrets().items():
         values.setdefault(key, value)
 
     for key in (
-        "OPENAI_API_KEY",
-        "OPENAI_MODEL",
-        "OPENAI_TIMEOUT_SECONDS",
-        "OPENAI_REASONING_EFFORT",
+        "GROQ_API_KEY",
+        "GROQ_MODEL",
+        "GROQ_TIMEOUT_SECONDS",
+        "GROQ_REASONING_EFFORT",
     ):
         if key in os.environ:
             values[key] = os.environ[key]
 
     reasoning_effort = str(
-        values.get("OPENAI_REASONING_EFFORT")
-        or DEFAULT_OPENAI_REASONING_EFFORT
+        values.get("GROQ_REASONING_EFFORT")
+        or DEFAULT_GROQ_REASONING_EFFORT
     ).lower().strip()
-    if reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
-        reasoning_effort = DEFAULT_OPENAI_REASONING_EFFORT
+    if reasoning_effort not in {"low", "medium", "high"}:
+        reasoning_effort = DEFAULT_GROQ_REASONING_EFFORT
 
     return {
-        "api_key": _real_key(values.get("OPENAI_API_KEY")),
-        "model": str(values.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL).strip(),
+        "api_key": _real_key(values.get("GROQ_API_KEY")),
+        "model": str(values.get("GROQ_MODEL") or DEFAULT_GROQ_MODEL).strip(),
         "timeout_seconds": _safe_int(
-            values.get("OPENAI_TIMEOUT_SECONDS"),
-            DEFAULT_OPENAI_TIMEOUT_SECONDS,
-            15,
-            180,
+            values.get("GROQ_TIMEOUT_SECONDS"),
+            DEFAULT_GROQ_TIMEOUT_SECONDS,
+            10,
+            120,
         ),
         "reasoning_effort": reasoning_effort,
     }
 
 
-def get_openai_status() -> dict[str, Any]:
-    settings = load_openai_settings()
+def get_groq_status() -> dict[str, Any]:
+    settings = load_groq_settings()
     return {
         "configured": bool(settings["api_key"]),
         "model": settings["model"],
@@ -184,10 +187,10 @@ def get_openai_status() -> dict[str, Any]:
 
 
 def get_ai_status() -> dict[str, Any]:
-    """화면에서 Gemini와 ChatGPT 설정 상태를 한 번에 확인합니다."""
+    """화면에서 Gemini와 Groq 설정 상태를 한 번에 확인합니다."""
     return {
         "gemini": get_gemini_status(),
-        "openai": get_openai_status(),
+        "groq": get_groq_status(),
     }
 
 
@@ -429,55 +432,62 @@ def _call_interaction(*, settings: dict[str, Any], prompt: str, timeout_seconds:
             pass
 
 
-def _call_openai_response(
+def _call_groq_chat(
     *,
     settings: dict[str, Any],
     prompt: str,
-    schema: dict[str, Any],
-    max_output_tokens: int,
+    max_completion_tokens: int,
 ) -> tuple[dict[str, Any], str, float]:
-    """OpenAI Responses API에서 JSON Schema 형태의 코스를 받습니다."""
-    from openai import OpenAI
-
+    """Groq의 OpenAI 호환 Chat Completions API에서 JSON 코스를 받습니다."""
     started = time.perf_counter()
-    client = OpenAI(
-        api_key=settings["api_key"],
-        timeout=settings["timeout_seconds"],
-        max_retries=0,
+    response = requests.post(
+        GROQ_CHAT_COMPLETIONS_URL,
+        headers={
+            "Authorization": f"Bearer {settings['api_key']}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        json={
+            "model": settings["model"],
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "너는 전남광주 로컬 미식 코스를 설계하는 큐레이터다. "
+                        "후보 ID만 선택하고 반드시 유효한 JSON 객체만 출력한다."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+            "max_completion_tokens": max_completion_tokens,
+            "response_format": {"type": "json_object"},
+            "reasoning_effort": settings["reasoning_effort"],
+            "include_reasoning": False,
+            "stream": False,
+        },
+        timeout=(5, settings["timeout_seconds"]),
     )
 
-    try:
-        response = client.responses.create(
-            model=settings["model"],
-            instructions=(
-                "너는 전남광주 로컬 미식 코스를 설계하는 큐레이터다. "
-                "사용자가 제공한 후보 ID만 선택하고 지정된 JSON Schema를 정확히 따른다."
-            ),
-            input=prompt,
-            reasoning={"effort": settings["reasoning_effort"]},
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "unnam_local_course_routes",
-                    "schema": schema,
-                    "strict": True,
-                }
-            },
-            max_output_tokens=max_output_tokens,
-            store=False,
-        )
-        output_text = str(getattr(response, "output_text", "") or "").strip()
-        if not output_text:
-            raise RuntimeError("ChatGPT 응답이 비어 있습니다.")
+    if response.status_code >= 400:
+        retry_after = response.headers.get("retry-after", "").strip()
+        body = response.text.strip().replace("\n", " ")[:500]
+        suffix = f" · {retry_after}초 후 재시도" if retry_after else ""
+        raise RuntimeError(f"Groq HTTP {response.status_code}: {body}{suffix}")
 
-        payload = _json_payload(output_text)
-        response_id = str(getattr(response, "id", "") or "")
-        return payload, response_id, time.perf_counter() - started
-    finally:
-        try:
-            client.close()
-        except Exception:
-            pass
+    try:
+        payload = response.json()
+        choice = (payload.get("choices") or [])[0]
+        content = str((choice.get("message") or {}).get("content") or "").strip()
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("Groq 응답 형식이 올바르지 않습니다.") from exc
+
+    if not content:
+        raise RuntimeError("Groq 응답이 비어 있습니다.")
+
+    result = _json_payload(content)
+    response_id = str(payload.get("id") or "")
+    return result, response_id, time.perf_counter() - started
 
 
 def _fallback_title(route_type: str, companion: str) -> str:
@@ -869,7 +879,7 @@ def generate_gemini_routes(*, region: str, restaurant: str, course_label: str, c
     }
 
 
-def generate_openai_routes(
+def generate_groq_routes(
     *,
     region: str,
     restaurant: str,
@@ -882,19 +892,19 @@ def generate_openai_routes(
     place_count: int,
     variation: int = 0,
 ) -> dict[str, Any]:
-    """OpenAI Responses API로 코스 세 개를 생성합니다."""
-    settings = load_openai_settings()
+    """Groq의 GPT-OSS 모델로 코스 세 개를 생성합니다."""
+    settings = load_groq_settings()
     prepared, original_by_id = _prepare_candidates(candidates, restaurant)
 
     if not settings["api_key"]:
         result = _failure(
             settings["model"],
-            "OPENAI_API_KEY가 설정되지 않았습니다.",
+            "GROQ_API_KEY가 설정되지 않았습니다.",
             0.0,
             False,
             [],
         )
-        result["provider"] = "openai"
+        result["provider"] = "groq"
         return result
 
     if not prepared:
@@ -905,11 +915,10 @@ def generate_openai_routes(
             False,
             [],
         )
-        result["provider"] = "openai"
+        result["provider"] = "groq"
         return result
 
     place_count = max(1, min(int(place_count), len(prepared), MAX_AI_PLACES))
-    schema = _schema(place_count, [str(item["id"]) for item in prepared])
     prompt = _build_prompt(
         region=region,
         restaurant=restaurant,
@@ -921,21 +930,20 @@ def generate_openai_routes(
         candidates=prepared,
         place_count=place_count,
         variation=variation,
-        compact_retry=False,
+        compact_retry=True,
     )
 
     started = time.perf_counter()
     attempts: list[dict[str, Any]] = []
     try:
-        payload, response_id, latency = _call_openai_response(
+        payload, response_id, latency = _call_groq_chat(
             settings=settings,
             prompt=prompt,
-            schema=schema,
-            max_output_tokens=1600,
+            max_completion_tokens=1200,
         )
         attempts.append(
             {
-                "name": "openai_structured",
+                "name": "groq_json",
                 "success": True,
                 "latency_seconds": round(latency, 2),
                 "error": "",
@@ -946,7 +954,7 @@ def generate_openai_routes(
         message = f"{type(exc).__name__}: {exc}"
         attempts.append(
             {
-                "name": "openai_structured",
+                "name": "groq_json",
                 "success": False,
                 "latency_seconds": round(latency, 2),
                 "error": message,
@@ -960,7 +968,7 @@ def generate_openai_routes(
             "timeout" in lowered or "timed out" in lowered,
             attempts,
         )
-        result["provider"] = "openai"
+        result["provider"] = "groq"
         return result
 
     try:
@@ -980,7 +988,7 @@ def generate_openai_routes(
             False,
             attempts,
         )
-        result["provider"] = "openai"
+        result["provider"] = "groq"
         return result
 
     return {
@@ -994,13 +1002,13 @@ def generate_openai_routes(
         "error": "",
         "timed_out": False,
         "attempts": attempts,
-        "provider": "openai",
+        "provider": "groq",
     }
 
 
-def generate_ai_routes(
+def _run_provider(
+    provider: str,
     *,
-    provider: str = "gemini",
     region: str,
     restaurant: str,
     course_label: str,
@@ -1010,12 +1018,10 @@ def generate_ai_routes(
     interests: Sequence[str],
     candidates: Sequence[dict[str, Any]],
     place_count: int,
-    variation: int = 0,
+    variation: int,
 ) -> dict[str, Any]:
-    """화면에서 선택한 공급자에 맞춰 동일한 코스 생성 인터페이스를 제공합니다."""
-    normalized = str(provider or "gemini").lower().strip()
-    if normalized in {"openai", "gpt", "chatgpt", "챗지피티"}:
-        return generate_openai_routes(
+    if provider == "groq":
+        return generate_groq_routes(
             region=region,
             restaurant=restaurant,
             course_label=course_label,
@@ -1043,3 +1049,88 @@ def generate_ai_routes(
     result["provider"] = "gemini"
     return result
 
+
+def generate_ai_routes(
+    *,
+    provider: str = "gemini",
+    region: str,
+    restaurant: str,
+    course_label: str,
+    course_minutes: int,
+    companion: str,
+    meal_time: str,
+    interests: Sequence[str],
+    candidates: Sequence[dict[str, Any]],
+    place_count: int,
+    variation: int = 0,
+) -> dict[str, Any]:
+    """
+    사용자가 선택한 AI를 먼저 호출합니다.
+
+    선택한 AI가 쿼터·타임아웃·응답 오류로 실패하면 다른 AI로 자동 전환하고,
+    두 AI가 모두 실패하면 main.py가 Python 기본 추천을 사용합니다.
+    """
+    normalized = str(provider or "gemini").lower().strip()
+    if normalized not in {"gemini", "groq"}:
+        normalized = "gemini"
+
+    status = get_ai_status()
+    order = [normalized, "groq" if normalized == "gemini" else "gemini"]
+    errors: list[str] = []
+    combined_attempts: list[dict[str, Any]] = []
+    total_started = time.perf_counter()
+
+    for index, current_provider in enumerate(order):
+        if not status[current_provider].get("configured"):
+            errors.append(
+                f"{current_provider}: API 키가 설정되지 않았습니다."
+            )
+            continue
+
+        result = _run_provider(
+            current_provider,
+            region=region,
+            restaurant=restaurant,
+            course_label=course_label,
+            course_minutes=course_minutes,
+            companion=companion,
+            meal_time=meal_time,
+            interests=interests,
+            candidates=candidates,
+            place_count=place_count,
+            variation=variation,
+        )
+
+        for attempt in result.get("attempts", []):
+            combined_attempts.append({"provider": current_provider, **attempt})
+
+        if result.get("success"):
+            result["provider"] = current_provider
+            result["requested_provider"] = normalized
+            result["fallback_used"] = index > 0
+            result["fallback_from"] = normalized if index > 0 else ""
+            result["attempts"] = combined_attempts
+            result["latency_seconds"] = round(
+                time.perf_counter() - total_started,
+                2,
+            )
+            return result
+
+        errors.append(f"{current_provider}: {result.get('error') or '요청 실패'}")
+
+    return {
+        "success": False,
+        "routes": [],
+        "model": "",
+        "latency_seconds": round(time.perf_counter() - total_started, 2),
+        "interaction_id": "",
+        "repair_count": 0,
+        "warnings": [],
+        "error": " | ".join(errors),
+        "timed_out": any("timeout" in error.lower() or "timed out" in error.lower() for error in errors),
+        "attempts": combined_attempts,
+        "provider": normalized,
+        "requested_provider": normalized,
+        "fallback_used": False,
+        "fallback_from": "",
+    }

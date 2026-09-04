@@ -113,20 +113,27 @@ INTEREST_CATEGORY = {
 }
 
 
-AI_PROVIDER_OPTIONS = ("Gemini", "ChatGPT")
+AI_PROVIDER_OPTIONS = ("Gemini", "Groq")
 AI_PROVIDER_IDS = {
     "Gemini": "gemini",
-    "ChatGPT": "openai",
+    "Groq": "groq",
 }
 AI_PROVIDER_NAMES = {
     "gemini": "Gemini",
-    "openai": "ChatGPT",
+    "groq": "Groq",
     "python": "기본 추천",
 }
 
 
 def ai_provider_name(value: Any) -> str:
     return AI_PROVIDER_NAMES.get(str(value or "").lower().strip(), "AI")
+
+
+def ai_model_name(provider: str, model: Any) -> str:
+    model_text = str(model or "").strip()
+    if provider == "groq" and model_text == "openai/gpt-oss-120b":
+        return "GPT-OSS 120B"
+    return model_text
 
 
 st.set_page_config(
@@ -1224,7 +1231,8 @@ def assemble_routes(
             "origin": origin if origin and origin.get("ok") else None,
             "stops": stops,
             "source": source,
-            "ai_provider": preferences.get("ai_provider", source if source in {"gemini", "openai"} else "gemini"),
+            "ai_provider": source if source in {"gemini", "groq"} else preferences.get("ai_provider", "gemini"),
+            "requested_ai_provider": preferences.get("ai_provider", "gemini"),
             "includes_lodging": bool(lodging_places),
         }
         route["estimated_minutes"] = estimate_route_minutes(route["origin"], stops)
@@ -1271,7 +1279,7 @@ def create_recommendations(
     )
 
     requested_provider = str(preferences.get("ai_provider") or "gemini").lower().strip()
-    if requested_provider not in {"gemini", "openai"}:
+    if requested_provider not in {"gemini", "groq"}:
         requested_provider = "gemini"
 
     result = generate_ai_routes(
@@ -1289,20 +1297,27 @@ def create_recommendations(
     )
 
     if result["success"]:
+        actual_provider = str(result.get("provider") or requested_provider).lower().strip()
+        if actual_provider not in {"gemini", "groq"}:
+            actual_provider = requested_provider
+
         routes = assemble_routes(
             result["routes"],
             restaurant,
             candidates,
             preferences,
             origin,
-            requested_provider,
+            actual_provider,
         )
         if routes:
             return (
                 routes,
                 {
-                    "source": requested_provider,
-                    "provider": requested_provider,
+                    "source": actual_provider,
+                    "provider": actual_provider,
+                    "requested_provider": requested_provider,
+                    "fallback_used": bool(result.get("fallback_used")),
+                    "fallback_from": str(result.get("fallback_from") or ""),
                     "model": result.get("model", ""),
                     "latency_seconds": result.get("latency_seconds", 0.0),
                     "repair_count": result.get("repair_count", 0),
@@ -1327,6 +1342,9 @@ def create_recommendations(
         {
             "source": "python",
             "provider": requested_provider,
+            "requested_provider": requested_provider,
+            "fallback_used": False,
+            "fallback_from": "",
             "model": result.get("model", ""),
             "latency_seconds": result.get("latency_seconds", 0.0),
             "repair_count": 0,
@@ -2376,7 +2394,7 @@ def page_home(places: pd.DataFrame) -> None:
         )
 
         selected_ai_label = st.segmented_control(
-            "코스 추천 AI",
+            "우선 사용할 코스 추천 AI",
             AI_PROVIDER_OPTIONS,
             default="Gemini",
             key="home_ai_provider",
@@ -2384,23 +2402,38 @@ def page_home(places: pd.DataFrame) -> None:
         ) or "Gemini"
         ai_provider = AI_PROVIDER_IDS[selected_ai_label]
         provider_status = ai_status[ai_provider]
+        alternate_provider = "groq" if ai_provider == "gemini" else "gemini"
+        alternate_status = ai_status[alternate_provider]
+        available_any = bool(
+            provider_status.get("configured")
+            or alternate_status.get("configured")
+        )
 
         if provider_status.get("configured"):
+            alternate_note = (
+                f" · 실패 시 {ai_provider_name(alternate_provider)}로 자동 전환"
+                if alternate_status.get("configured")
+                else ""
+            )
             st.caption(
-                f"✨ {selected_ai_label} · {provider_status.get('model', '')}로 코스를 만들어요."
+                f"✨ {selected_ai_label} 우선 · {ai_model_name(ai_provider, provider_status.get('model', ''))}{alternate_note}"
+            )
+        elif alternate_status.get("configured"):
+            st.info(
+                f"{selected_ai_label} 키가 없어 {ai_provider_name(alternate_provider)}로 자동 전환해요."
             )
         else:
-            key_name = "GEMINI_API_KEY" if ai_provider == "gemini" else "OPENAI_API_KEY"
+            key_name = "GEMINI_API_KEY" if ai_provider == "gemini" else "GROQ_API_KEY"
             st.warning(
-                f"{selected_ai_label} API 키가 설정되지 않았어요. "
-                f"`.streamlit/secrets.toml`의 `{key_name}`를 확인해 주세요."
+                f"사용 가능한 AI 키가 없어요. `.streamlit/secrets.toml`의 "
+                f"`{key_name}` 또는 다른 AI 키를 확인해 주세요."
             )
 
         clicked = st.button(
-            f"✨ {selected_ai_label}로 미식 코스 만들기",
+            f"✨ {selected_ai_label} 우선으로 미식 코스 만들기",
             type="primary",
             width="stretch",
-            disabled=(not has_restaurant or not provider_status.get("configured")),
+            disabled=(not has_restaurant or not available_any),
             key="create_course",
         )
 
@@ -2461,16 +2494,30 @@ def page_home(places: pd.DataFrame) -> None:
 def render_recommendation_status() -> None:
     meta = st.session_state.ai_meta
     source = str(meta.get("source") or "")
-    if source in {"gemini", "openai"}:
+    if source in {"gemini", "groq"}:
         latency = float(meta.get("latency_seconds") or 0.0)
         provider = ai_provider_name(source)
+        requested = str(meta.get("requested_provider") or source)
+        fallback_used = bool(meta.get("fallback_used"))
+
+        if fallback_used and requested != source:
+            detail = (
+                f"{ai_provider_name(requested)} 응답이 어려워 {provider}로 자동 전환했어요"
+                f"{' · ' + format(latency, '.1f') + '초' if latency else ''}"
+            )
+        else:
+            detail = (
+                "동행과 관심사를 반영했어요"
+                f"{' · ' + format(latency, '.1f') + '초' if latency else ''}"
+            )
+
         ui(
             f"""
             <div class="proof">
                 <div class="proof-icon">✦</div>
                 <div>
                     <b>{h(provider)} 맞춤 코스가 완성됐어요</b>
-                    <span>동행과 관심사를 반영했어요{' · ' + format(latency, '.1f') + '초' if latency else ''}</span>
+                    <span>{h(detail)}</span>
                 </div>
             </div>
             """
@@ -2483,7 +2530,7 @@ def render_recommendation_status() -> None:
                 <div class="proof-icon">!</div>
                 <div>
                     <b>기본 추천 코스를 보여드리고 있어요</b>
-                    <span>{h(requested)} 요청이 실패하면 아래의 한 개 재시도 버튼으로 다시 요청할 수 있어요.</span>
+                    <span>{h(requested)}와 보조 AI 요청이 모두 실패하면 아래 버튼으로 다시 요청할 수 있어요.</span>
                 </div>
             </div>
             """
@@ -2851,7 +2898,11 @@ def open_saved_route(route_id_value: str) -> None:
         "start_time": target.get("start_time", "10:00"),
         "origin_address": str((target.get("origin") or {}).get("address") or ""),
         "interests": list(target.get("interests", [])),
-        "ai_provider": str(target.get("ai_provider") or (target.get("source") if target.get("source") in {"gemini", "openai"} else "gemini")),
+        "ai_provider": str(
+            target.get("requested_ai_provider")
+            or target.get("ai_provider")
+            or (target.get("source") if target.get("source") in {"gemini", "groq"} else "gemini")
+        ),
     }
     saved_provider = st.session_state.preferences["ai_provider"]
     st.session_state.ai_meta = {
@@ -2947,15 +2998,15 @@ def page_my(places: pd.DataFrame) -> None:
     render_section("연결 상태", "APP STATUS", "시연 준비 확인")
     ai_status = get_ai_status()
     gemini = ai_status["gemini"]
-    openai_status = ai_status["openai"]
+    groq_status = ai_status["groq"]
     naver = get_naver_status()
     live = st.session_state.naver_live
 
     with st.expander("AI·지도·데이터 상태"):
         st.write("**Gemini 키:** " + ("설정됨" if gemini["configured"] else "키 없음"))
-        st.write(f"**Gemini 모델:** `{gemini['model']}`")
-        st.write("**OpenAI 키:** " + ("설정됨" if openai_status["configured"] else "키 없음"))
-        st.write(f"**ChatGPT 모델:** `{openai_status['model']}`")
+        st.write(f"**Gemini 모델:** `{ai_model_name('gemini', gemini['model'])}`")
+        st.write("**Groq 키:** " + ("설정됨" if groq_status["configured"] else "키 없음"))
+        st.write(f"**Groq 모델:** `{ai_model_name('groq', groq_status['model'])}`")
         st.write("**네이버 지도 키:** " + ("설정됨" if naver["configured"] else "키 없음"))
         st.write(f"**Geocoding 최근 상태:** `{live.get('geocoding', '미확인')}`")
         st.write(f"**자동차 경로 최근 상태:** `{live.get('directions', '미확인')}`")
@@ -2969,7 +3020,7 @@ def page_my(places: pd.DataFrame) -> None:
 
         if st.session_state.ai_meta.get("source"):
             source_value = str(st.session_state.ai_meta.get("source") or "")
-            if source_value in {"gemini", "openai"}:
+            if source_value in {"gemini", "groq"}:
                 source_text = f"{ai_provider_name(source_value)} API"
             else:
                 requested = st.session_state.ai_meta.get("provider") or st.session_state.preferences.get("ai_provider")
