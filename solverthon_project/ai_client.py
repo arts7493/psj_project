@@ -18,1024 +18,562 @@ SECRETS_PATH = BASE_DIR / ".streamlit" / "secrets.toml"
 
 DEFAULT_MODEL = "gemini-3.6-flash"
 DEFAULT_TIMEOUT_SECONDS = 45
+DEFAULT_RETRY_TIMEOUT_SECONDS = 30
+MAX_CANDIDATES = 12
+MAX_AI_PLACES = 4
 
-# 실제 거리·이동시간·영업정보가 없는 상태에서
-# AI가 만들어 내면 안 되는 표현
+ROUTE_TYPES = (
+    "가까운 동네",
+    "취향 집중",
+    "식사 전후",
+)
+
 UNSUPPORTED_FACT = re.compile(
     r"\d+(?:\.\d+)?\s*(?:km|킬로미터|m|미터)"
     r"|(?:도보|차량|자동차|택시|버스)\s*\d+\s*(?:분|시간)"
     r"|실시간\s*(?:혼잡|대기|영업)"
-    r"|현재\s*(?:영업|휴무)"
-    r"|정확히\s*\d+\s*분",
+    r"|현재\s*(?:영업|휴무)",
     re.IGNORECASE,
 )
 
+COMPANION_CONFLICTS = {
+    "혼자": re.compile(r"데이트|커플|연인과|아이와|자녀와|가족과"),
+    "연인": re.compile(r"혼밥|혼자만|아이와|자녀와|가족\s*나들이"),
+    "가족": re.compile(r"데이트|커플\s*전용|연인만|혼밥|혼자만"),
+    "친구": re.compile(r"데이트\s*전용|커플\s*전용|혼밥|혼자만"),
+}
 
-# -----------------------------------------------------------------------------
-# 설정 읽기
-# -----------------------------------------------------------------------------
+
 def _read_local_secrets() -> dict[str, Any]:
-    """
-    로컬의 .streamlit/secrets.toml을 읽는다.
-    """
     if not SECRETS_PATH.exists():
         return {}
-
     try:
         with SECRETS_PATH.open("rb") as file:
             return dict(tomllib.load(file))
-
     except Exception:
         return {}
 
 
 def _read_streamlit_secrets() -> dict[str, Any]:
-    """
-    배포 환경의 Streamlit Secrets를 읽는다.
-    """
     try:
         import streamlit as st
 
         result: dict[str, Any] = {}
-
         for key in (
             "GEMINI_API_KEY",
             "GEMINI_MODEL",
             "AI_TIMEOUT_SECONDS",
+            "AI_RETRY_TIMEOUT_SECONDS",
         ):
             try:
                 if key in st.secrets:
                     result[key] = st.secrets[key]
-
             except Exception:
                 pass
-
         return result
-
     except Exception:
         return {}
 
 
-def _valid_key(value: Any) -> str:
-    """
-    실제 Gemini API 키인지 검사한다.
-    """
+def _real_key(value: Any) -> str:
     text = str(value or "").strip()
-
     placeholders = (
         "PUT_YOUR_",
         "YOUR_API_KEY",
         "REPLACE_ME",
-        "실제_GEMINI",
+        "여기에",
+        "실제_",
+        "기존에_",
     )
-
     if not text:
         return ""
-
-    if any(
-        word.upper() in text.upper()
-        for word in placeholders
-    ):
+    if any(token.upper() in text.upper() for token in placeholders):
         return ""
-
     return text
 
 
+def _safe_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        number = default
+    return max(minimum, min(number, maximum))
+
+
 def load_gemini_settings() -> dict[str, Any]:
-    """
-    Gemini 설정을 읽는다.
-
-    우선순위:
-    환경변수
-    → 로컬 secrets.toml
-    → Streamlit Cloud Secrets
-    → 기본값
-    """
     values = _read_local_secrets()
-
-    # 로컬 파일에 없는 값만
-    # Streamlit Cloud Secrets로 보완한다.
     for key, value in _read_streamlit_secrets().items():
         values.setdefault(key, value)
-
-    # 환경변수가 가장 높은 우선순위다.
     for key in (
         "GEMINI_API_KEY",
         "GEMINI_MODEL",
         "AI_TIMEOUT_SECONDS",
+        "AI_RETRY_TIMEOUT_SECONDS",
     ):
         if key in os.environ:
             values[key] = os.environ[key]
 
-    try:
-        timeout = int(
-            float(
-                values.get(
-                    "AI_TIMEOUT_SECONDS",
-                    DEFAULT_TIMEOUT_SECONDS,
-                )
-            )
-        )
-
-    except (TypeError, ValueError):
-        timeout = DEFAULT_TIMEOUT_SECONDS
-
     return {
-        "api_key": _valid_key(
-            values.get("GEMINI_API_KEY")
-        ),
-        "model": (
-            str(
-                values.get(
-                    "GEMINI_MODEL",
-                    DEFAULT_MODEL,
-                )
-            ).strip()
-            or DEFAULT_MODEL
-        ),
-        "timeout_seconds": max(
-            15,
-            min(timeout, 90),
-        ),
+        "api_key": _real_key(values.get("GEMINI_API_KEY")),
+        "model": str(values.get("GEMINI_MODEL") or DEFAULT_MODEL).strip(),
+        "timeout_seconds": _safe_int(values.get("AI_TIMEOUT_SECONDS"), DEFAULT_TIMEOUT_SECONDS, 15, 90),
+        "retry_timeout_seconds": _safe_int(values.get("AI_RETRY_TIMEOUT_SECONDS"), DEFAULT_RETRY_TIMEOUT_SECONDS, 15, 60),
     }
 
 
 def get_gemini_status() -> dict[str, Any]:
-    """
-    키 자체는 노출하지 않고
-    설정 여부와 모델만 반환한다.
-    """
     settings = load_gemini_settings()
-
     return {
-        "configured": bool(
-            settings["api_key"]
-        ),
+        "configured": bool(settings["api_key"]),
         "model": settings["model"],
-        "timeout_seconds": (
-            settings["timeout_seconds"]
-        ),
+        "timeout_seconds": settings["timeout_seconds"],
+        "retry_timeout_seconds": settings["retry_timeout_seconds"],
     }
 
 
-# -----------------------------------------------------------------------------
-# 후보 데이터와 프롬프트
-# -----------------------------------------------------------------------------
-def _first_text(
-    item: dict[str, Any],
-    *keys: str,
-) -> str:
-    """
-    여러 후보 컬럼 중 처음 발견되는 값을 반환한다.
-    """
+def _pick(item: dict[str, Any], *keys: str) -> str:
     for key in keys:
         value = item.get(key, "")
-
-        if (
-            value is not None
-            and str(value).strip()
-        ):
+        if value is not None and str(value).strip():
             return str(value).strip()
-
     return ""
 
 
-def _prepare_candidates(
-    candidates: Sequence[dict[str, Any]],
-    restaurant: str,
-) -> list[dict[str, str]]:
-    """
-    Gemini에 전달할 지역 후보 장소를 정리한다.
-    """
-    prepared: list[dict[str, str]] = []
-    seen: set[str] = set()
+def _safe_float(value: Any) -> float | None:
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _prepare_candidates(candidates: Sequence[dict[str, Any]], restaurant: str) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    prepared: list[dict[str, Any]] = []
+    original_by_id: dict[str, dict[str, Any]] = {}
+    seen_names: set[str] = set()
 
     for item in candidates:
-        name = _first_text(
-            item,
-            "이름",
-            "name",
-        )
-
-        if (
-            not name
-            or name == restaurant
-            or name in seen
-        ):
+        name = _pick(item, "이름", "name")
+        if not name or name == restaurant or name in seen_names:
             continue
+        seen_names.add(name)
+        candidate_id = f"P{len(prepared) + 1:02d}"
+        category = _pick(item, "카테고리", "category") or "장소"
+        tags = _pick(item, "태그", "키워드", "tags")
+        compact = {
+            "id": candidate_id,
+            "name": name,
+            "category": category,
+            "distance_km": _safe_float(item.get("distance_km")),
+            "same_area": bool(item.get("same_subregion") or item.get("same_area")),
+            "interest_score": int(item.get("interest_score") or 0),
+            "companion_score": int(item.get("companion_score") or 0),
+            "tags": tags[:80],
+        }
+        original = {**item, "candidate_id": candidate_id, "name": name, "category": category}
+        prepared.append(compact)
+        original_by_id[candidate_id] = original
+        if len(prepared) >= MAX_CANDIDATES:
+            break
 
-        seen.add(name)
-
-        prepared.append(
-            {
-                "name": name,
-                "category": (
-                    _first_text(
-                        item,
-                        "카테고리",
-                        "category",
-                    )
-                    or "장소"
-                ),
-                "address": _first_text(
-                    item,
-                    "주소",
-                    "address",
-                ),
-                "tags": _first_text(
-                    item,
-                    "태그",
-                    "키워드",
-                    "tags",
-                ),
-            }
-        )
-
-    # 요청 크기가 과도하게 커지지 않도록 제한한다.
-    return prepared[:30]
+    return prepared, original_by_id
 
 
-def _requested_place_count(
-    wait_minutes: int,
-    candidate_count: int,
-) -> int:
-    """
-    대기시간에 따라 코스에 넣을 장소 수를 정한다.
-
-    30~45분:
-    식사 전 1곳 + 식사 후 1곳
-
-    60~75분:
-    식사 전 2곳 + 식사 후 1곳
-
-    90분 이상:
-    식사 전 3곳 + 식사 후 1곳
-    """
-    if wait_minutes <= 45:
-        count = 2
-
-    elif wait_minutes <= 75:
-        count = 3
-
-    else:
-        count = 4
-
-    return max(
-        1,
-        min(
-            count,
-            candidate_count,
-        ),
-    )
+def _companion_rule(companion: str) -> str:
+    return {
+        "혼자": "혼자 이동하고 머물기 자연스러운 표현을 쓴다. 데이트, 커플, 연인, 아이, 가족 동반 표현은 쓰지 않는다.",
+        "연인": "두 사람이 산책·사진·분위기를 함께 즐기는 방향으로 쓴다. 혼밥, 혼자만의 시간, 아이 동반 표현은 쓰지 않는다.",
+        "가족": "세대가 함께 편안하게 식사하고 둘러보는 가족 나들이로 쓴다. 데이트, 커플 전용, 혼밥 표현은 쓰지 않는다.",
+        "친구": "친구와 함께 둘러보고 대화하거나 체험하기 좋은 방향으로 쓴다. 커플 전용, 혼밥, 혼자만의 시간 표현은 쓰지 않는다.",
+    }.get(companion, "선택한 동행 유형에 맞는 자연스러운 표현을 쓴다.")
 
 
-def _route_schema(
-    place_count: int,
-    candidate_names: Sequence[str],
-) -> dict[str, Any]:
-    """
-    Gemini 구조화 출력용 동적 JSON Schema.
-
-    장소 이름을 enum으로 제한하므로
-    CSV에 없는 장소명을 반환할 수 없다.
-    """
+def _schema(place_count: int, candidate_ids: Sequence[str]) -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
             "routes": {
                 "type": "array",
-                "description": (
-                    "서로 분위기가 다른 "
-                    "추천 코스 3개"
-                ),
                 "minItems": 3,
                 "maxItems": 3,
                 "items": {
                     "type": "object",
                     "properties": {
-                        "title": {
-                            "type": "string",
-                            "description": (
-                                "15자 안팎의 자연스러운 "
-                                "한국어 코스명"
-                            ),
-                        },
-                        "summary": {
-                            "type": "string",
-                            "description": (
-                                "동행과 관심사를 반영한 "
-                                "한 문장 설명"
-                            ),
-                        },
-                        "places": {
+                        "route_type": {"type": "string", "enum": list(ROUTE_TYPES)},
+                        "title": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "place_ids": {
                             "type": "array",
-                            "description": (
-                                "후보에서 고른 방문 장소. "
-                                "마지막 장소는 식사 후 방문지"
-                            ),
                             "minItems": place_count,
                             "maxItems": place_count,
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "name": {
-                                        "type": "string",
-                                        "description": (
-                                            "후보 목록의 name과 "
-                                            "완전히 같은 장소명"
-                                        ),
-                                        "enum": list(
-                                            candidate_names
-                                        ),
-                                    },
-                                    "reason": {
-                                        "type": "string",
-                                        "description": (
-                                            "거리나 영업정보를 "
-                                            "넣지 않은 짧은 추천 이유"
-                                        ),
-                                    },
-                                },
-                                "required": [
-                                    "name",
-                                    "reason",
-                                ],
-                                "additionalProperties": False,
-                            },
+                            "items": {"type": "string", "enum": list(candidate_ids)},
+                        },
+                        "reasons": {
+                            "type": "array",
+                            "minItems": place_count,
+                            "maxItems": place_count,
+                            "items": {"type": "string"},
                         },
                     },
-                    "required": [
-                        "title",
-                        "summary",
-                        "places",
-                    ],
+                    "required": ["route_type", "title", "summary", "place_ids", "reasons"],
                     "additionalProperties": False,
                 },
             }
         },
-        "required": [
-            "routes",
-        ],
+        "required": ["routes"],
         "additionalProperties": False,
     }
 
 
-def _build_prompt(
-    *,
-    region: str,
-    restaurant: str,
-    wait_minutes: int,
-    companion: str,
-    meal_time: str,
-    interests: Sequence[str],
-    candidates: Sequence[dict[str, str]],
-    place_count: int,
-    variation: int,
-) -> str:
-    """
-    사용자 조건과 CSV 후보를 프롬프트로 만든다.
-    """
-    before_count = (
-        max(1, place_count - 1)
-        if place_count > 1
-        else 1
-    )
+def _build_prompt(*, region: str, restaurant: str, course_label: str, course_minutes: int, companion: str, meal_time: str, interests: Sequence[str], candidates: Sequence[dict[str, Any]], place_count: int, variation: int, compact_retry: bool) -> str:
+    interest_text = ", ".join(interests) if interests else "특별히 없음"
+    candidate_json = json.dumps(list(candidates), ensure_ascii=False, separators=(",", ":") if compact_retry else None)
+    base = f"""
+너는 전남광주 로컬 미식 코스 큐레이터다.
 
-    interest_text = (
-        ", ".join(interests)
-        if interests
-        else "특별히 없음"
-    )
-
-    candidate_json = json.dumps(
-        list(candidates),
-        ensure_ascii=False,
-        indent=2,
-    )
-
-    return f"""
-너는 광주·전남 맛집 대기시간을 지역 경험으로 바꾸는
-모바일 서비스 'WAITGO'의 여행 코스 큐레이터다.
-
-아래 사용자 조건과 후보 장소를 이용해
-추천 코스 3개를 만들어라.
-
-[사용자 조건]
-
+사용자 조건:
 - 지역: {region}
-- 대기 중인 맛집: {restaurant}
-- 예상 대기시간: {wait_minutes}분
-- 동행 유형: {companion}
-- 식사 시간대: {meal_time}
-- 관심 분야: {interest_text}
+- 오늘 방문할 식당: {restaurant}
+- 코스 길이: {course_label} (약 {course_minutes}분)
+- 식사 시간: {meal_time}
+- 동행: {companion}
+- 관심사: {interest_text}
 - 재추천 번호: {variation}
 
-[반드시 지킬 규칙]
+동행 규칙:
+{_companion_rule(companion)}
 
-1. 제공된 후보 장소만 사용한다.
-2. 장소명은 후보의 name을 한 글자도 바꾸지 않고 그대로 쓴다.
-3. 선택 맛집은 추천 places에 넣지 않는다.
-   앱이 식사 단계로 별도 추가한다.
-4. 각 코스에는 정확히 {place_count}개의 장소를 넣는다.
-5. 각 코스의 앞 {before_count}개는 식사 전 대기시간 활용 장소이고,
-   마지막 장소는 식사 후 방문지다.
-6. 한 코스 안에서는 같은 장소를 중복하지 않는다.
-7. 세 코스는 제목, 분위기, 장소 조합이 가능한 한 다르게 한다.
-8. 좌표와 지도 API가 없으므로 거리,
-   도보시간, 차량시간을 추측하지 않는다.
-9. 영업시간, 휴무일, 실시간 혼잡도,
-   실제 대기정보를 추측하지 않는다.
-10. 제목, 요약, 추천 이유는 짧고 자연스러운 한국어로 작성한다.
-11. 반환 형식은 지정된 JSON Schema를 정확히 따른다.
+코스 역할:
+1. 가까운 동네: same_area=true와 distance_km가 작은 후보를 우선한다.
+2. 취향 집중: interest_score와 companion_score가 높은 후보를 우선한다.
+3. 식사 전후: 관광명소·문화공간·카페가 한쪽으로 치우치지 않게 고른다.
 
-[사용 가능한 후보 장소]
+반드시 지킬 규칙:
+- 위 역할 순서대로 정확히 3개 코스를 만든다.
+- 각 코스는 서로 다른 분위기와 가능한 한 다른 장소 조합을 사용한다.
+- 각 코스의 place_ids는 정확히 {place_count}개이며 중복하지 않는다.
+- 후보의 id만 사용한다. 오늘 방문할 식당은 앱이 따로 넣으므로 후보에서 선택하지 않는다.
+- 거리·이동시간·영업시간·휴무·실시간 정보는 문장으로 추측하지 않는다.
+- 제목, 요약, 이유는 짧고 자연스러운 한국어로 쓴다.
+- 2시간·3시간 코스는 카페를 최대 1곳까지만 고른다.
+- 반나절·하루 코스는 카페를 최대 2곳까지만 고른다.
+- 카페만 반복하지 말고 가능한 경우 관광명소 또는 문화공간을 반드시 1곳 이상 포함한다.
+- 식사 전후 코스는 같은 카테고리만 반복하지 않는다.
 
+후보:
 {candidate_json}
 """.strip()
+    if compact_retry:
+        base += '\nJSON만 출력한다. 형식:{"routes":[{"route_type":"가까운 동네","title":"제목","summary":"요약","place_ids":["P01"],"reasons":["이유"]},{"route_type":"취향 집중","title":"제목","summary":"요약","place_ids":["P02"],"reasons":["이유"]},{"route_type":"식사 전후","title":"제목","summary":"요약","place_ids":["P03"],"reasons":["이유"]}]}'
+    return base
 
 
-# -----------------------------------------------------------------------------
-# Gemini 응답 검증
-# -----------------------------------------------------------------------------
-def _normalize(text: str) -> str:
-    """
-    공백과 특수문자를 제거해 장소명을 비교한다.
-    """
-    return re.sub(
-        r"[\W_]+",
-        "",
-        str(text),
-        flags=re.UNICODE,
-    ).casefold()
+def _extract_output_text(interaction: Any) -> str:
+    text = str(getattr(interaction, "output_text", "") or "").strip()
+    if text:
+        return text
+    outputs = getattr(interaction, "outputs", None) or []
+    for output in reversed(outputs):
+        text = str(getattr(output, "text", "") or "").strip()
+        if text:
+            return text
+    return ""
 
 
-def _safe_text(
-    value: Any,
-    fallback: str,
-    limit: int,
-) -> str:
-    """
-    AI 문장을 정리하고,
-    지원하지 않는 사실 표현이 있으면
-    안전한 기본 문장으로 교체한다.
-    """
-    text = re.sub(
-        r"\s+",
-        " ",
-        str(value or ""),
-    ).strip()
+def _json_payload(text: str) -> dict[str, Any]:
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("JSON 객체를 찾지 못했습니다.")
+    return json.loads(cleaned[start : end + 1])
 
-    if (
-        not text
-        or UNSUPPORTED_FACT.search(text)
-    ):
+
+def _call_interaction(*, settings: dict[str, Any], prompt: str, timeout_seconds: int, schema: dict[str, Any] | None, thinking_level: str, max_output_tokens: int) -> tuple[dict[str, Any], str, float]:
+    from google import genai
+    from google.genai import types
+
+    started = time.perf_counter()
+    client = genai.Client(
+        api_key=settings["api_key"],
+        http_options=types.HttpOptions(
+            timeout=timeout_seconds * 1000,
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
+    try:
+        arguments: dict[str, Any] = {
+            "model": settings["model"],
+            "input": prompt,
+            "generation_config": {
+                "thinking_level": thinking_level,
+                "temperature": 0.25,
+                "max_output_tokens": max_output_tokens,
+            },
+            "store": False,
+        }
+        if schema is not None:
+            arguments["response_format"] = {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": schema,
+            }
+        interaction = client.interactions.create(**arguments)
+        output_text = _extract_output_text(interaction)
+        if not output_text:
+            raise RuntimeError("Gemini 응답이 비어 있습니다.")
+        payload = _json_payload(output_text)
+        interaction_id = str(getattr(interaction, "id", "") or "")
+        return payload, interaction_id, time.perf_counter() - started
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _fallback_title(route_type: str, companion: str) -> str:
+    table = {
+        "혼자": {"가까운 동네": "혼자 천천히 즐기는 동네 한 바퀴", "취향 집중": "내 취향대로 고르는 남도 산책", "식사 전후": "혼자서도 여유로운 미식 하루"},
+        "연인": {"가까운 동네": "둘이 가볍게 즐기는 동네 데이트", "취향 집중": "취향을 나누는 남도 데이트", "식사 전후": "산책과 식사를 잇는 둘만의 코스"},
+        "가족": {"가까운 동네": "가족과 편안한 동네 나들이", "취향 집중": "온 가족 취향을 담은 남도 여행", "식사 전후": "식사와 관광을 잇는 가족 하루"},
+        "친구": {"가까운 동네": "친구와 가볍게 도는 동네 코스", "취향 집중": "친구와 취향대로 즐기는 남도 여행", "식사 전후": "맛과 이야기가 이어지는 친구 코스"},
+    }
+    return table.get(companion, {}).get(route_type, f"{route_type} 추천 코스")
+
+
+def _fallback_summary(route_type: str, companion: str) -> str:
+    return {
+        "가까운 동네": "오늘 방문할 식당과 가까운 장소를 우선해 이동 부담을 줄였어요.",
+        "취향 집중": f"{companion} 여행과 선택한 관심 분야를 중심으로 골랐어요.",
+        "식사 전후": "식사 전 관광과 식사 후 휴식을 균형 있게 연결했어요.",
+    }.get(route_type, "선택한 조건에 맞춘 지역 코스예요.")
+
+
+def _safe_text(value: Any, fallback: str, companion: str, limit: int) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    conflict = COMPANION_CONFLICTS.get(companion)
+    if not text or UNSUPPORTED_FACT.search(text) or (conflict is not None and conflict.search(text)):
         text = fallback
-
     return text[:limit].rstrip()
 
 
-def _default_reason(
-    category: str,
-    companion: str,
-) -> str:
-    """
-    AI 이유를 사용할 수 없을 때의 기본 문장.
-    """
-    prefix = {
-        "혼자": "혼자서도 편안하게",
-        "연인": "함께 분위기를 즐기며",
-        "가족": "가족과 여유롭게",
-        "친구": "친구와 가볍게",
-    }.get(
-        companion,
-        "여유롭게",
-    )
-
-    ending = {
-        "관광명소": (
-            "둘러보기 좋은 지역 명소예요."
-        ),
-        "문화공간": (
-            "새로운 이야기를 만나기 좋은 공간이에요."
-        ),
-        "카페": (
-            "잠시 쉬어가기 좋은 카페예요."
-        ),
-    }.get(
-        category,
-        "방문하기 좋은 장소예요.",
-    )
-
-    return f"{prefix} {ending}"
+def _candidate_fill_order(route_type: str, candidates: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    if route_type == "가까운 동네":
+        return sorted(candidates, key=lambda item: (not bool(item.get("same_area") or item.get("same_subregion")), item.get("distance_km") is None, float(item.get("distance_km") or 9999)))
+    if route_type == "취향 집중":
+        return sorted(candidates, key=lambda item: (-int(item.get("interest_score") or 0), -int(item.get("companion_score") or 0), item.get("distance_km") is None, float(item.get("distance_km") or 9999)))
+    category_order = {"관광명소": 0, "문화공간": 1, "카페": 2}
+    return sorted(candidates, key=lambda item: (category_order.get(str(item.get("category")), 9), item.get("distance_km") is None, float(item.get("distance_km") or 9999)))
 
 
-def _resolve_candidate(
-    requested_name: str,
-    exact: dict[str, dict[str, str]],
-    normalized: dict[str, dict[str, str]],
-    candidates: Sequence[dict[str, str]],
-) -> tuple[
-    dict[str, str] | None,
-    bool,
-]:
-    """
-    정확한 장소명을 우선 사용한다.
-
-    공백이나 괄호 차이만 있는 경우에는
-    유일하게 일치하는 후보로 보정한다.
-    """
-    if requested_name in exact:
-        return exact[requested_name], False
-
-    normalized_name = _normalize(
-        requested_name
-    )
-
-    if normalized_name in normalized:
-        return (
-            normalized[normalized_name],
-            True,
-        )
-
-    partial_matches = [
-        item
-        for item in candidates
-        if normalized_name
-        and (
-            normalized_name
-            in _normalize(item["name"])
-            or _normalize(item["name"])
-            in normalized_name
-        )
-    ]
-
-    if len(partial_matches) == 1:
-        return partial_matches[0], True
-
-    return None, False
+def _max_cafe_count(course_label: str) -> int:
+    return 1 if course_label in ("2시간", "3시간") else 2
 
 
-def region_friendly_title(
-    index: int,
-) -> str:
-    """
-    AI 제목이 없을 때 사용할 코스명.
-    """
-    return (
-        "여유로운 대기 산책",
-        "취향을 담은 지역 발견",
-        "식사 뒤까지 이어지는 하루",
-    )[min(index, 2)]
+def _category_of(item: dict[str, Any]) -> str:
+    return str(item.get("category") or item.get("카테고리") or "장소")
 
 
-def _validate_routes(
-    payload: dict[str, Any],
-    candidates: Sequence[dict[str, str]],
-    place_count: int,
-    companion: str,
-) -> tuple[
-    list[dict[str, Any]],
-    int,
-    list[str],
-]:
-    """
-    Gemini 결과를 CSV 후보와 대조한다.
+def _balance_selected_ids(selected_ids: list[str], prepared: Sequence[dict[str, Any]], route_type: str, course_label: str) -> list[str]:
+    compact_by_id = {str(item["id"]): item for item in prepared}
+    selected_ids = [candidate_id for candidate_id in selected_ids if candidate_id in compact_by_id]
+    limit = _max_cafe_count(course_label)
 
-    후보 밖 장소나 중복 장소는 제거하고,
-    부족한 부분만 CSV 후보로 보충한다.
-    """
+    def selected_items() -> list[dict[str, Any]]:
+        return [compact_by_id[candidate_id] for candidate_id in selected_ids if candidate_id in compact_by_id]
+
+    extras = [i for i, candidate_id in enumerate(selected_ids) if _category_of(compact_by_id[candidate_id]) == "카페"]
+    if len(extras) > limit:
+        replacements = [item for item in _candidate_fill_order(route_type, prepared) if _category_of(item) != "카페" and str(item["id"]) not in selected_ids]
+        for index in extras[limit:]:
+            if not replacements:
+                break
+            selected_ids[index] = str(replacements.pop(0)["id"])
+
+    selected_set = set(selected_ids)
+    if not any(_category_of(item) in {"관광명소", "문화공간"} for item in selected_items()):
+        scenic = [item for item in _candidate_fill_order(route_type, prepared) if _category_of(item) in {"관광명소", "문화공간"} and str(item["id"]) not in selected_set]
+        if scenic and selected_ids:
+            replace_index = next((i for i, candidate_id in enumerate(selected_ids) if _category_of(compact_by_id[candidate_id]) == "카페"), len(selected_ids) - 1)
+            selected_ids[replace_index] = str(scenic[0]["id"])
+
+    deduped: list[str] = []
+    for candidate_id in selected_ids:
+        if candidate_id not in deduped:
+            deduped.append(candidate_id)
+    return deduped
+
+
+def _validate_routes(payload: dict[str, Any], prepared: Sequence[dict[str, Any]], original_by_id: dict[str, dict[str, Any]], place_count: int, companion: str, course_label: str) -> tuple[list[dict[str, Any]], int, list[str]]:
     raw_routes = payload.get("routes")
+    if not isinstance(raw_routes, list):
+        raise ValueError("routes 배열이 없습니다.")
 
-    if (
-        not isinstance(raw_routes, list)
-        or not raw_routes
-    ):
-        raise RuntimeError(
-            "Gemini 응답에 routes가 없습니다."
-        )
+    raw_by_type: dict[str, dict[str, Any]] = {}
+    leftovers: list[dict[str, Any]] = []
+    for raw in raw_routes:
+        if not isinstance(raw, dict):
+            continue
+        route_type = str(raw.get("route_type") or "").strip()
+        if route_type in ROUTE_TYPES and route_type not in raw_by_type:
+            raw_by_type[route_type] = raw
+        else:
+            leftovers.append(raw)
 
-    exact = {
-        item["name"]: item
-        for item in candidates
-    }
-
-    normalized = {
-        _normalize(item["name"]): item
-        for item in candidates
-    }
-
+    compact_by_id = {str(item["id"]): item for item in prepared}
     validated: list[dict[str, Any]] = []
     repair_count = 0
-    warnings: list[str] = []
-    used_titles: set[str] = set()
 
-    for route_index in range(3):
-        raw_route = (
-            raw_routes[route_index]
-            if route_index < len(raw_routes)
-            else {}
-        )
+    for route_type in ROUTE_TYPES:
+        raw = raw_by_type.get(route_type) or (leftovers.pop(0) if leftovers else {})
+        raw_ids = raw.get("place_ids") if isinstance(raw, dict) else []
+        raw_reasons = raw.get("reasons") if isinstance(raw, dict) else []
+        if not isinstance(raw_ids, list):
+            raw_ids = []
+        if not isinstance(raw_reasons, list):
+            raw_reasons = []
 
-        if not isinstance(
-            raw_route,
-            dict,
-        ):
-            raw_route = {}
-
-        raw_places = raw_route.get(
-            "places",
-            [],
-        )
-
-        if not isinstance(
-            raw_places,
-            list,
-        ):
-            raw_places = []
-
-        selected: list[dict[str, Any]] = []
-        used_names: set[str] = set()
-
-        for choice in raw_places:
-            if not isinstance(
-                choice,
-                dict,
-            ):
-                continue
-
-            requested_name = str(
-                choice.get(
-                    "name",
-                    "",
-                )
-            ).strip()
-
-            candidate, repaired_name = (
-                _resolve_candidate(
-                    requested_name,
-                    exact,
-                    normalized,
-                    candidates,
-                )
-            )
-
-            if (
-                candidate is None
-                or candidate["name"]
-                in used_names
-            ):
+        selected_ids: list[str] = []
+        reasons_by_id: dict[str, str] = {}
+        for index, value in enumerate(raw_ids):
+            candidate_id = str(value or "").strip()
+            if candidate_id not in compact_by_id or candidate_id in selected_ids:
                 repair_count += 1
                 continue
-
-            if repaired_name:
-                repair_count += 1
-
-            used_names.add(
-                candidate["name"]
-            )
-
-            selected.append(
-                {
-                    **candidate,
-                    "reason": _safe_text(
-                        choice.get("reason"),
-                        _default_reason(
-                            candidate["category"],
-                            companion,
-                        ),
-                        100,
-                    ),
-                }
-            )
-
-            if (
-                len(selected)
-                == place_count
-            ):
+            selected_ids.append(candidate_id)
+            reasons_by_id[candidate_id] = str(raw_reasons[index] if index < len(raw_reasons) else "")
+            if len(selected_ids) == place_count:
                 break
 
-        # 후보 밖 장소나 중복 때문에 부족하면
-        # CSV 후보로만 보충한다.
-        if len(selected) < place_count:
-            offset = (
-                route_index
-                * max(1, place_count)
-            ) % max(
-                1,
-                len(candidates),
-            )
-
-            rotated = (
-                list(candidates[offset:])
-                + list(candidates[:offset])
-            )
-
-            for candidate in rotated:
-                if (
-                    candidate["name"]
-                    in used_names
-                ):
+        if len(selected_ids) < place_count:
+            for candidate in _candidate_fill_order(route_type, prepared):
+                candidate_id = str(candidate["id"])
+                if candidate_id in selected_ids:
                     continue
-
-                used_names.add(
-                    candidate["name"]
-                )
-
-                selected.append(
-                    {
-                        **candidate,
-                        "reason": _default_reason(
-                            candidate["category"],
-                            companion,
-                        ),
-                    }
-                )
-
+                selected_ids.append(candidate_id)
                 repair_count += 1
-
-                if (
-                    len(selected)
-                    == place_count
-                ):
+                if len(selected_ids) == place_count:
                     break
 
-        if not selected:
-            raise RuntimeError(
-                "검증 후 사용할 수 있는 "
-                "추천 장소가 없습니다."
-            )
+        balanced_ids = _balance_selected_ids(selected_ids, prepared, route_type, course_label)
+        if balanced_ids != selected_ids:
+            repair_count += 1
+        selected_ids = balanced_ids
 
-        title = _safe_text(
-            raw_route.get("title"),
-            region_friendly_title(
-                route_index
-            ),
-            32,
-        )
+        if len(selected_ids) < place_count:
+            for candidate in _candidate_fill_order(route_type, prepared):
+                candidate_id = str(candidate["id"])
+                if candidate_id in selected_ids:
+                    continue
+                selected_ids.append(candidate_id)
+                if len(selected_ids) == place_count:
+                    break
 
-        if title in used_titles:
-            title = (
-                f"{title} "
-                f"{route_index + 1}"
-            )
+        places: list[dict[str, Any]] = []
+        for candidate_id in selected_ids[:place_count]:
+            original = original_by_id[candidate_id]
+            reason = _safe_text(reasons_by_id.get(candidate_id), _fallback_summary(route_type, companion), companion, 110)
+            places.append({**original, "reason": reason})
 
-        used_titles.add(title)
+        title = _safe_text(raw.get("title") if isinstance(raw, dict) else "", _fallback_title(route_type, companion), companion, 38)
+        summary = _safe_text(raw.get("summary") if isinstance(raw, dict) else "", _fallback_summary(route_type, companion), companion, 125)
+        validated.append({"route_type": route_type, "title": title, "summary": summary, "places": places})
 
-        validated.append(
-            {
-                "title": title,
-                "summary": _safe_text(
-                    raw_route.get("summary"),
-                    (
-                        "선택한 취향에 맞춰 구성한 "
-                        "지역 코스예요."
-                    ),
-                    100,
-                ),
-                "places": selected,
-            }
-        )
-
+    warnings: list[str] = []
     if repair_count:
-        warnings.append(
-            "AI 결과 중 "
-            f"{repair_count}개 항목을 "
-            "CSV 기준으로 안전하게 보정했습니다."
-        )
-
-    return (
-        validated,
-        repair_count,
-        warnings,
-    )
+        warnings.append(f"{repair_count}개 항목을 후보 데이터 기준으로 보정했습니다.")
+    return validated, repair_count, warnings
 
 
-# -----------------------------------------------------------------------------
-# 외부에서 호출할 공개 함수
-# -----------------------------------------------------------------------------
-def _failure(
-    model: str,
-    error: str,
-    latency: float = 0.0,
-) -> dict[str, Any]:
+def _failure(model: str, error: str, latency: float, timed_out: bool, attempts: Sequence[dict[str, Any]]) -> dict[str, Any]:
     return {
         "success": False,
         "routes": [],
         "model": model,
-        "latency_seconds": round(
-            latency,
-            2,
-        ),
+        "latency_seconds": round(latency, 2),
         "interaction_id": "",
         "repair_count": 0,
         "warnings": [],
         "error": error,
+        "timed_out": timed_out,
+        "attempts": list(attempts),
     }
 
 
-def generate_gemini_routes(
-    *,
-    region: str,
-    restaurant: str,
-    wait_minutes: int,
-    companion: str,
-    meal_time: str,
-    interests: Sequence[str],
-    candidates: Sequence[dict[str, Any]],
-    variation: int = 0,
-) -> dict[str, Any]:
-    """
-    Gemini Interactions API로 추천 코스 3개를 만든다.
-
-    실패해도 예외를 main.py로 던지지 않고
-    success=False를 반환한다.
-    """
+def generate_gemini_routes(*, region: str, restaurant: str, course_label: str, course_minutes: int, companion: str, meal_time: str, interests: Sequence[str], candidates: Sequence[dict[str, Any]], place_count: int, variation: int = 0) -> dict[str, Any]:
     settings = load_gemini_settings()
-
-    prepared = _prepare_candidates(
-        candidates,
-        restaurant,
-    )
+    prepared, original_by_id = _prepare_candidates(candidates, restaurant)
 
     if not settings["api_key"]:
-        return _failure(
-            settings["model"],
-            (
-                "GEMINI_API_KEY가 "
-                "설정되지 않았습니다."
-            ),
-        )
-
+        return _failure(settings["model"], "GEMINI_API_KEY가 설정되지 않았습니다.", 0.0, False, [])
     if not prepared:
-        return _failure(
-            settings["model"],
-            (
-                "추천에 사용할 주변 장소가 "
-                "없습니다."
-            ),
+        return _failure(settings["model"], "추천에 사용할 주변 장소가 없습니다.", 0.0, False, [])
+
+    place_count = max(1, min(int(place_count), len(prepared), MAX_AI_PLACES))
+    schema = _schema(place_count, [str(item["id"]) for item in prepared])
+
+    attempts: list[dict[str, Any]] = []
+    total_started = time.perf_counter()
+    errors: list[str] = []
+    interaction_id = ""
+    payload: dict[str, Any] | None = None
+
+    call_specs = (
+        {"name": "structured", "timeout": settings["timeout_seconds"], "schema": schema, "thinking": "low", "max_tokens": 1050, "compact_retry": False},
+        {"name": "compact_retry", "timeout": settings["retry_timeout_seconds"], "schema": None, "thinking": "minimal", "max_tokens": 900, "compact_retry": True},
+    )
+
+    for spec in call_specs:
+        prompt = _build_prompt(
+            region=region,
+            restaurant=restaurant,
+            course_label=course_label,
+            course_minutes=course_minutes,
+            companion=companion,
+            meal_time=meal_time,
+            interests=interests,
+            candidates=prepared,
+            place_count=place_count,
+            variation=variation,
+            compact_retry=bool(spec["compact_retry"]),
         )
+        started = time.perf_counter()
+        try:
+            payload, interaction_id, latency = _call_interaction(
+                settings=settings,
+                prompt=prompt,
+                timeout_seconds=int(spec["timeout"]),
+                schema=spec["schema"],
+                thinking_level=str(spec["thinking"]),
+                max_output_tokens=int(spec["max_tokens"]),
+            )
+            attempts.append({"name": spec["name"], "success": True, "latency_seconds": round(latency, 2), "error": ""})
+            break
+        except Exception as exc:
+            latency = time.perf_counter() - started
+            message = f"{type(exc).__name__}: {exc}"
+            errors.append(f"{spec['name']}: {message}")
+            attempts.append({"name": spec["name"], "success": False, "latency_seconds": round(latency, 2), "error": message})
 
-    place_count = _requested_place_count(
-        int(wait_minutes),
-        len(prepared),
-    )
-
-    prompt = _build_prompt(
-        region=region,
-        restaurant=restaurant,
-        wait_minutes=int(wait_minutes),
-        companion=companion,
-        meal_time=meal_time,
-        interests=interests,
-        candidates=prepared,
-        place_count=place_count,
-        variation=int(variation),
-    )
-
-    client = None
-    started = time.perf_counter()
+    total_latency = time.perf_counter() - total_started
+    if payload is None:
+        timed_out = any("timeout" in error.lower() or "timed out" in error.lower() for error in errors)
+        return _failure(settings["model"], " | ".join(errors), total_latency, timed_out, attempts)
 
     try:
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(
-            api_key=settings["api_key"],
-            http_options=types.HttpOptions(
-                timeout=(
-                    settings[
-                        "timeout_seconds"
-                    ]
-                    * 1000
-                ),
-                retry_options=(
-                    types.HttpRetryOptions(
-                        attempts=1,
-                    )
-                ),
-            ),
-        )
-
-        # 별도 연결 테스트에서 성공한
-        # Interactions API 흐름을 그대로 사용한다.
-        #
-        # 불필요한 system_instruction,
-        # generation_config를 제거해
-        # SDK 호환 문제를 최소화한다.
-        interaction = (
-            client.interactions.create(
-                model=settings["model"],
-                input=prompt,
-                response_format={
-                    "type": "text",
-                    "mime_type": (
-                        "application/json"
-                    ),
-                    "schema": _route_schema(
-                        place_count,
-                        [
-                            item["name"]
-                            for item in prepared
-                        ],
-                    ),
-                },
-                store=False,
-            )
-        )
-
-        latency = (
-            time.perf_counter()
-            - started
-        )
-
-        output_text = str(
-            getattr(
-                interaction,
-                "output_text",
-                "",
-            )
-            or ""
-        ).strip()
-
-        if not output_text:
-            raise RuntimeError(
-                "Gemini의 JSON 응답이 "
-                "비어 있습니다."
-            )
-
-        # 구조화 출력이어도 방어적으로
-        # JSON 코드블록 표시를 제거한다.
-        output_text = re.sub(
-            r"^```(?:json)?\s*|\s*```$",
-            "",
-            output_text,
-            flags=re.IGNORECASE,
-        ).strip()
-
-        try:
-            payload = json.loads(
-                output_text
-            )
-
-        except json.JSONDecodeError as exc:
-            preview = (
-                output_text[:300]
-                .replace("\n", " ")
-            )
-
-            raise RuntimeError(
-                "Gemini JSON 해석 실패: "
-                f"{preview}"
-            ) from exc
-
-        (
-            routes,
-            repair_count,
-            warnings,
-        ) = _validate_routes(
-            payload,
-            prepared,
-            place_count,
-            companion,
-        )
-
-        return {
-            "success": True,
-            "routes": routes,
-            "model": settings["model"],
-            "latency_seconds": round(
-                latency,
-                2,
-            ),
-            "interaction_id": str(
-                getattr(
-                    interaction,
-                    "id",
-                    "",
-                )
-                or ""
-            ),
-            "repair_count": repair_count,
-            "warnings": warnings,
-            "error": "",
-        }
-
+        routes, repair_count, warnings = _validate_routes(payload, prepared, original_by_id, place_count, companion, course_label)
     except Exception as exc:
-        latency = (
-            time.perf_counter()
-            - started
-        )
+        return _failure(settings["model"], f"응답 검증 실패: {type(exc).__name__}: {exc}", total_latency, False, attempts)
 
-        return _failure(
-            settings["model"],
-            f"{type(exc).__name__}: {exc}",
-            latency,
-        )
-
-    finally:
-        if client is not None:
-            try:
-                client.close()
-
-            except Exception:
-                pass
+    return {
+        "success": True,
+        "routes": routes,
+        "model": settings["model"],
+        "latency_seconds": round(total_latency, 2),
+        "interaction_id": interaction_id,
+        "repair_count": repair_count,
+        "warnings": warnings,
+        "error": "",
+        "timed_out": False,
+        "attempts": attempts,
+    }
