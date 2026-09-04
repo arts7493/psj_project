@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
@@ -166,9 +167,11 @@ def _request_json(
 
 
 def normalize_address(address: str) -> str:
+    """네이버 Geocoding에 보낼 때만 대회용 광주 표기를 공식 주소로 바꿉니다."""
     text = " ".join(str(address or "").split())
+    text = text.replace("전남광주통합특별시", "광주광역시")
     text = text.replace("전남광주", "광주광역시")
-    return text
+    return " ".join(text.split())
 
 
 def _address_part(address: dict[str, Any], part_type: str) -> str:
@@ -221,11 +224,31 @@ def _geocode_cached(
     )
 
 
+def _geocode_query_candidates(address: str) -> list[str]:
+    """장소명이 뒤에 붙은 주소도 찾을 수 있도록 전체 주소와 도로명 부분을 순서대로 만듭니다."""
+    normalized = normalize_address(address)
+    if not normalized:
+        return []
+
+    candidates = [normalized]
+    patterns = (
+        r"^(.+?(?:대로|로|길)\s+\d+(?:-\d+)?)\b",
+        r"^(.+?(?:동|리|가)\s+\d+(?:-\d+)?)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            shortened = " ".join(match.group(1).split())
+            if shortened and shortened not in candidates:
+                candidates.append(shortened)
+
+    return candidates
+
 def geocode(address: str) -> dict[str, Any]:
     settings = load_naver_settings()
-    clean_address = normalize_address(address)
+    queries = _geocode_query_candidates(address)
 
-    if not clean_address:
+    if not queries:
         return {"ok": False, "error": "주소가 비어 있습니다.", "source": ""}
 
     if not (settings["client_id"] and settings["client_secret"]):
@@ -235,35 +258,57 @@ def geocode(address: str) -> dict[str, Any]:
             "source": "",
         }
 
-    (
-        ok,
-        lat,
-        lng,
-        road_address,
-        jibun_address,
-        sigugun,
-        dongmyun,
-        endpoint,
-        error,
-    ) = _geocode_cached(
-        clean_address,
-        settings["client_id"],
-        settings["client_secret"],
-        settings["timeout_seconds"],
-    )
+    errors: list[str] = []
+    for clean_address in queries:
+        (
+            ok,
+            lat,
+            lng,
+            road_address,
+            jibun_address,
+            sigugun,
+            dongmyun,
+            endpoint,
+            error,
+        ) = _geocode_cached(
+            clean_address,
+            settings["client_id"],
+            settings["client_secret"],
+            settings["timeout_seconds"],
+        )
+
+        if ok:
+            return {
+                "ok": True,
+                "lat": lat,
+                "lng": lng,
+                "road_address": road_address,
+                "jibun_address": jibun_address,
+                "sigugun": sigugun,
+                "dongmyun": dongmyun,
+                "source": "naver",
+                "endpoint": endpoint,
+                "query_used": clean_address,
+                "error": "",
+            }
+
+        if error:
+            errors.append(str(error))
 
     return {
-        "ok": bool(ok),
-        "lat": lat,
-        "lng": lng,
-        "road_address": road_address,
-        "jibun_address": jibun_address,
-        "sigugun": sigugun,
-        "dongmyun": dongmyun,
-        "source": "naver" if ok else "",
-        "endpoint": endpoint,
-        "error": error,
+        "ok": False,
+        "lat": None,
+        "lng": None,
+        "road_address": "",
+        "jibun_address": "",
+        "sigugun": "",
+        "dongmyun": "",
+        "source": "",
+        "endpoint": "",
+        "query_used": "",
+        "error": " | ".join(dict.fromkeys(errors)) or "주소 검색 결과가 없습니다.",
     }
+
 
 
 def geocode_many(items: list[dict[str, Any]], max_workers: int = 4) -> list[dict[str, Any]]:
@@ -440,8 +485,57 @@ def get_driving_route(start: dict[str, Any], goal: dict[str, Any]) -> dict[str, 
     }
 
 
+def _clean_search_name(name: str) -> str:
+    """네이버 장소 검색에 맞게 이름은 유지하고 불필요한 표기만 줄입니다."""
+    text = " ".join(str(name or "").split())
+    replacements = (
+        ("전남광주통합특별시청", "광주시청"),
+        ("전남광주통합특별시", "광주"),
+        ("광주광역시청", "광주시청"),
+        ("광주광역시", "광주"),
+        ("전남광주", "광주"),
+    )
+    for before, after in replacements:
+        text = text.replace(before, after)
+
+    # 괄호 안 지점명은 유지하되 검색을 방해하는 괄호 기호만 제거합니다.
+    text = re.sub(r"[\(\)\[\]\{\}]", " ", text)
+    return " ".join(text.split())
+
+
+def _short_search_hint(address: str) -> str:
+    """전체 주소 대신 구·시·군 한 단어만 검색 보조어로 사용합니다."""
+    text = " ".join(str(address or "").split())
+
+    if any(token in text for token in ("전남광주", "광주광역시", "전남광주통합특별시")):
+        district = re.search(r"([가-힣]+구)", text)
+        return district.group(1) if district else "광주"
+
+    match = re.search(r"(?:전라남도|전남)\s+([가-힣]+(?:시|군))", text)
+    if match:
+        return match.group(1)
+
+    return ""
+
+
 def build_naver_search_url(name: str, address: str = "") -> str:
-    query = " ".join(part for part in (str(name).strip(), normalize_address(address)) if part)
+    """
+    긴 도로명 주소는 제외하고 장소명 중심의 짧은 검색어를 만듭니다.
+
+    이름에 지역명이 없고 이름이 짧거나 흔할 수 있는 경우에만
+    구·시·군을 한 단어 덧붙입니다. 화면용 주소는 변경하지 않습니다.
+    """
+    clean_name = _clean_search_name(name)
+    hint = _short_search_hint(address)
+
+    if not clean_name:
+        query = hint
+    elif hint and hint.replace("시", "").replace("군", "").replace("구", "") not in clean_name:
+        query = f"{clean_name} {hint}"
+    else:
+        query = clean_name
+
+    query = " ".join(query.split())[:80]
     return f"https://map.naver.com/p/search/{quote(query, safe='')}"
 
 

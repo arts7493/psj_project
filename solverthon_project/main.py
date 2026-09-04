@@ -55,6 +55,7 @@ CATEGORY_ICON = {
     "관광명소": "🌿",
     "문화공간": "🎨",
     "카페": "☕",
+    "숙소": "🏨",
     "출발지": "📍",
 }
 
@@ -72,6 +73,7 @@ COURSE_OPTIONS: dict[str, dict[str, int]] = {
         "places": 2,
         "stay": 20,
         "meal_stay": 50,
+        "lodging_stay": 0,
     },
     "3시간": {
         "minutes": 180,
@@ -80,6 +82,7 @@ COURSE_OPTIONS: dict[str, dict[str, int]] = {
         "places": 3,
         "stay": 25,
         "meal_stay": 60,
+        "lodging_stay": 0,
     },
     "반나절": {
         "minutes": 300,
@@ -88,6 +91,7 @@ COURSE_OPTIONS: dict[str, dict[str, int]] = {
         "places": 4,
         "stay": 30,
         "meal_stay": 60,
+        "lodging_stay": 90,
     },
     "하루": {
         "minutes": 480,
@@ -96,6 +100,7 @@ COURSE_OPTIONS: dict[str, dict[str, int]] = {
         "places": 4,
         "stay": 45,
         "meal_stay": 70,
+        "lodging_stay": 120,
     },
 }
 
@@ -202,6 +207,10 @@ def region_sort_key(region: str) -> tuple[int, str]:
     return 1, region
 
 def set_page(page: str) -> None:
+    """페이지를 이동하고, 체크인 화면의 일회성 메시지는 다른 화면에 남기지 않습니다."""
+    if page != CHECKIN:
+        st.session_state.qr_feedback = None
+        st.session_state.qr_last_input_sig = ""
     st.session_state.page = page
 
 
@@ -277,7 +286,7 @@ def load_places(path: str, modified_time: int) -> pd.DataFrame:
         axis=1,
     )
 
-    category_order = {"맛집": 0, "관광명소": 1, "문화공간": 2, "카페": 3}
+    category_order = {"맛집": 0, "관광명소": 1, "문화공간": 2, "카페": 3, "숙소": 4}
     df["_order"] = df["카테고리"].map(category_order).fillna(99)
 
     df = (
@@ -381,12 +390,41 @@ def companion_score(item: dict[str, Any], companion: str) -> int:
     return 2 if companion in text else 0
 
 
+def lodging_enabled(course_label: str) -> bool:
+    return course_label in {"반나절", "하루"}
+
+
+def place_category(item: dict[str, Any]) -> str:
+    return str(item.get("category") or item.get("카테고리") or "장소").strip()
+
+
+def limit_candidate_pool(
+    candidates: list[dict[str, Any]],
+    course_label: str,
+    limit: int = 12,
+) -> list[dict[str, Any]]:
+    """짧은 코스에서는 숙소를 제외하고, 긴 코스에서는 숙소 1곳을 후보에 보존합니다."""
+    if not lodging_enabled(course_label):
+        return [item for item in candidates if place_category(item) != "숙소"][:limit]
+
+    lodgings = [item for item in candidates if place_category(item) == "숙소"]
+    activities = [item for item in candidates if place_category(item) != "숙소"]
+
+    if not lodgings:
+        return activities[:limit]
+
+    selected = activities[: max(0, limit - 1)] + [lodgings[0]]
+    return selected[:limit]
+
+
 def prepare_candidate_pool(
     places: pd.DataFrame,
     restaurant_name: str,
     preferences: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], dict[str, Any]]:
     region = preferences["region"]
+    course_label = preferences["course_label"]
+
     restaurant_rows = places[
         (places["지역"] == region)
         & (places["카테고리"] == "맛집")
@@ -406,10 +444,15 @@ def prepare_candidate_pool(
         }
     )
 
+    candidate_rows = places[
+        (places["지역"] == region)
+        & (places["카테고리"] != "맛집")
+    ]
+    if not lodging_enabled(course_label):
+        candidate_rows = candidate_rows[candidate_rows["카테고리"] != "숙소"]
+
     raw_candidates: list[dict[str, Any]] = []
-    for item in places[
-        (places["지역"] == region) & (places["카테고리"] != "맛집")
-    ].to_dict("records"):
+    for item in candidate_rows.to_dict("records"):
         item = dict(item)
         item["interest_score"] = interest_score(
             item,
@@ -421,7 +464,7 @@ def prepare_candidate_pool(
     if not raw_candidates:
         return restaurant, [], {"error": "선택 지역에 주변 장소가 없습니다."}
 
-    config = COURSE_OPTIONS[preferences["course_label"]]
+    config = COURSE_OPTIONS[course_label]
     soft_radius = float(config["soft_radius_km"])
     hard_radius = float(config["hard_radius_km"])
     naver_status = get_naver_status()
@@ -442,21 +485,24 @@ def prepare_candidate_pool(
 
         raw_candidates.sort(
             key=lambda item: (
+                place_category(item) == "숙소",
                 not bool(item.get("same_subregion")),
                 -int(item.get("interest_score") or 0),
                 -int(item.get("companion_score") or 0),
                 str(item.get("이름") or ""),
             )
         )
-
+        pool = limit_candidate_pool(raw_candidates, course_label)
         return (
             restaurant,
-            raw_candidates[:12],
+            pool,
             {
                 "configured": False,
                 "geocoding_status": "키 없음",
                 "geocoded_count": 0,
                 "candidate_count": len(raw_candidates),
+                "pool_count": len(pool),
+                "lodging_available": any(place_category(item) == "숙소" for item in raw_candidates),
                 "soft_radius_km": soft_radius,
                 "hard_radius_km": hard_radius,
                 "error": "네이버 지도 키가 없어 행정구역 기준으로 후보를 정렬했습니다.",
@@ -482,19 +528,22 @@ def prepare_candidate_pool(
 
         raw_candidates.sort(
             key=lambda item: (
+                place_category(item) == "숙소",
                 not bool(item.get("same_subregion")),
                 -int(item.get("interest_score") or 0),
             )
         )
-
+        pool = limit_candidate_pool(raw_candidates, course_label)
         return (
             restaurant,
-            raw_candidates[:12],
+            pool,
             {
                 "configured": True,
                 "geocoding_status": "실패",
                 "geocoded_count": 0,
                 "candidate_count": len(raw_candidates),
+                "pool_count": len(pool),
+                "lodging_available": any(place_category(item) == "숙소" for item in raw_candidates),
                 "soft_radius_km": soft_radius,
                 "hard_radius_km": hard_radius,
                 "error": str(anchor_geo.get("error") or "선택한 식당 좌표 변환 실패"),
@@ -526,6 +575,7 @@ def prepare_candidate_pool(
 
     usable.sort(
         key=lambda item: (
+            place_category(item) == "숙소",
             not bool(item.get("same_subregion")),
             float(item.get("distance_km") or 9999) > soft_radius,
             float(item.get("distance_km") or 9999),
@@ -533,16 +583,22 @@ def prepare_candidate_pool(
             -int(item.get("companion_score") or 0),
         )
     )
+    failed_same_area.sort(
+        key=lambda item: (
+            place_category(item) == "숙소",
+            -int(item.get("interest_score") or 0),
+        )
+    )
 
-    # 좌표 실패 장소는 같은 하위지역인 경우에만 부족분 보완용으로 쓴다.
-    pool = usable[:12]
-    if len(pool) < 4:
+    combined = usable.copy()
+    if len(combined) < 12:
         for item in failed_same_area:
-            if item not in pool:
-                pool.append(item)
-            if len(pool) >= 4:
+            if item not in combined:
+                combined.append(item)
+            if len(combined) >= 12:
                 break
 
+    pool = limit_candidate_pool(combined, course_label)
     geocoded_count = sum(1 for item in enriched if item.get("ok"))
     status = "성공" if geocoded_count == len(enriched) else "일부 성공"
 
@@ -555,11 +611,13 @@ def prepare_candidate_pool(
             "geocoded_count": geocoded_count,
             "candidate_count": len(enriched),
             "pool_count": len(pool),
+            "lodging_available": any(place_category(item) == "숙소" for item in combined),
             "soft_radius_km": soft_radius,
             "hard_radius_km": hard_radius,
             "error": " | ".join(errors[:4]),
         },
     )
+
 
 
 # -----------------------------------------------------------------------------
@@ -806,84 +864,217 @@ def normalize_selected_places(
         return []
 
     target_count = len(selected)
-    limit = max_cafe_count(preferences["course_label"])
-    used_names = {str(item.get("name") or item.get("이름") or "").strip() for item in selected}
+    course_label = preferences["course_label"]
+    cafe_limit = max_cafe_count(course_label)
+    lodging_required = lodging_enabled(course_label) and any(
+        place_category(item) == "숙소" for item in candidate_pool
+    )
 
-    def category_of(item: dict[str, Any]) -> str:
-        return str(item.get("category") or item.get("카테고리") or "장소")
+    def name_of(item: dict[str, Any]) -> str:
+        return str(item.get("name") or item.get("이름") or "").strip()
 
-    non_cafe_candidates = [
-        item for item in sorted(candidate_pool, key=lambda row: candidate_priority(row, route_type))
-        if category_of(item) != "카페" and str(item.get("name") or item.get("이름") or "").strip() not in used_names
-    ]
+    def complete(item: dict[str, Any]) -> dict[str, Any]:
+        category = place_category(item)
+        return {
+            **item,
+            "name": name_of(item),
+            "address": str(item.get("address") or item.get("주소") or "").strip(),
+            "category": category,
+            "reason": str(
+                item.get("reason")
+                or (
+                    "코스 마지막에 대실·휴식 또는 숙박으로 연결할 수 있는 숙소예요."
+                    if category == "숙소"
+                    else fallback_summary(route_type, preferences["companion"])
+                )
+            ).strip(),
+        }
 
-    cafes = [item for item in selected if category_of(item) == "카페"]
-    if len(cafes) > limit:
-        kept = []
-        cafe_kept = 0
-        for item in selected:
-            if category_of(item) == "카페":
-                if cafe_kept < limit:
-                    kept.append(item)
-                    cafe_kept += 1
-                elif non_cafe_candidates:
-                    replacement = non_cafe_candidates.pop(0)
-                    used_names.add(str(replacement.get("name") or replacement.get("이름") or "").strip())
-                    kept.append(replacement)
-                else:
-                    kept.append(item)
-            else:
-                kept.append(item)
-        selected = kept
-
-    scenic_count = sum(1 for item in selected if category_of(item) in {"관광명소", "문화공간"})
-    if scenic_count == 0:
-        replacements = [
-            item for item in sorted(candidate_pool, key=lambda row: candidate_priority(row, route_type))
-            if category_of(item) in {"관광명소", "문화공간"}
-            and str(item.get("name") or item.get("이름") or "").strip() not in {str(row.get("name") or row.get("이름") or "").strip() for row in selected}
-        ]
-        if replacements:
-            replace_index = next((i for i, item in enumerate(selected) if category_of(item) == "카페"), len(selected)-1)
-            selected[replace_index] = replacements[0]
-
-    selected = sorted(selected, key=lambda item: candidate_priority(item, route_type))
-    selected = reorder_to_reduce_repetition(selected)
-
-    # 점심 코스의 첫 장소는 가능하면 카페가 아닌 장소로 둡니다.
-    if preferences.get("meal_time") == "점심" and selected:
-        first_cat = category_of(selected[0])
-        if first_cat == "카페":
-            non_cafe_index = next(
-                (i for i, item in enumerate(selected) if category_of(item) != "카페"),
-                None,
-            )
-            if non_cafe_index not in (None, 0):
-                selected[0], selected[non_cafe_index] = selected[non_cafe_index], selected[0]
-
-    # 카페 과다 보정 과정에서 candidate_pool의 원본 행이 들어오면
-    # AI가 만든 reason 필드가 없을 수 있으므로 화면용 필드를 항상 완성합니다.
-    normalized: list[dict[str, Any]] = []
-    for item in selected[:target_count]:
-        name = str(item.get("name") or item.get("이름") or "").strip()
-        if not name:
+    unique: list[dict[str, Any]] = []
+    used_names: set[str] = set()
+    for item in selected:
+        completed = complete(item)
+        if not completed["name"] or completed["name"] in used_names:
             continue
+        used_names.add(completed["name"])
+        unique.append(completed)
+    selected = unique
 
-        category = str(item.get("category") or item.get("카테고리") or "장소").strip()
-        normalized.append(
-            {
-                **item,
-                "name": name,
-                "address": str(item.get("address") or item.get("주소") or "").strip(),
-                "category": category,
-                "reason": str(
-                    item.get("reason")
-                    or fallback_summary(route_type, preferences["companion"])
-                ).strip(),
-            }
+    ordered_pool = [complete(item) for item in sorted(candidate_pool, key=lambda row: candidate_priority(row, route_type))]
+
+    def replacement(predicate: Any) -> dict[str, Any] | None:
+        current_names = {name_of(item) for item in selected}
+        return next(
+            (
+                item for item in ordered_pool
+                if name_of(item) not in current_names and predicate(item)
+            ),
+            None,
         )
 
-    return normalized
+    # 2시간·3시간 코스는 숙소를 넣지 않습니다.
+    if not lodging_enabled(course_label):
+        cleaned: list[dict[str, Any]] = []
+        for item in selected:
+            if place_category(item) != "숙소":
+                cleaned.append(item)
+                continue
+            substitute = replacement(lambda row: place_category(row) != "숙소")
+            if substitute is not None:
+                cleaned.append(substitute)
+        selected = cleaned
+
+    # 반나절·하루 코스에는 해당 지역의 숙소 후보가 있으면 정확히 1곳을 넣습니다.
+    if lodging_required:
+        lodgings = [item for item in selected if place_category(item) == "숙소"]
+        activities = [item for item in selected if place_category(item) != "숙소"]
+        best_lodging = next((item for item in ordered_pool if place_category(item) == "숙소"), None)
+        lodging = lodgings[0] if lodgings else best_lodging
+
+        # 숙소 때문에 전체 장소 수가 늘지 않도록 활동 장소 하나를 교체합니다.
+        activity_target = max(0, target_count - 1)
+        activities = activities[:activity_target]
+        selected = activities + ([lodging] if lodging is not None else [])
+
+    # 카페가 지나치게 많으면 관광명소·문화공간 등으로 교체합니다.
+    cafe_indices = [index for index, item in enumerate(selected) if place_category(item) == "카페"]
+    if len(cafe_indices) > cafe_limit:
+        for index in cafe_indices[cafe_limit:]:
+            substitute = replacement(
+                lambda row: place_category(row) not in {"카페", "숙소"}
+            )
+            if substitute is not None:
+                selected[index] = substitute
+            else:
+                selected[index] = {}
+        selected = [item for item in selected if item]
+
+    # 관광 또는 문화 공간이 후보에 있다면 최소 한 곳을 포함합니다.
+    activities = [item for item in selected if place_category(item) != "숙소"]
+    if not any(place_category(item) in {"관광명소", "문화공간"} for item in activities):
+        scenic = replacement(lambda row: place_category(row) in {"관광명소", "문화공간"})
+        if scenic is not None:
+            replace_index = next(
+                (
+                    index for index, item in enumerate(selected)
+                    if place_category(item) == "카페"
+                ),
+                next(
+                    (
+                        index for index, item in reversed(list(enumerate(selected)))
+                        if place_category(item) != "숙소"
+                    ),
+                    None,
+                ),
+            )
+            if replace_index is not None:
+                selected[replace_index] = scenic
+
+    # 부족분을 채우되 카페 한도와 숙소 규칙을 유지합니다.
+    while len(selected) < target_count:
+        current_names = {name_of(item) for item in selected}
+        current_cafes = sum(1 for item in selected if place_category(item) == "카페")
+        candidate = next(
+            (
+                item for item in ordered_pool
+                if name_of(item) not in current_names
+                and not (
+                    place_category(item) == "카페" and current_cafes >= cafe_limit
+                )
+                and not (
+                    place_category(item) == "숙소"
+                    and any(place_category(existing) == "숙소" for existing in selected)
+                )
+            ),
+            None,
+        )
+        if candidate is None:
+            break
+        selected.append(candidate)
+
+    lodging_items = [item for item in selected if place_category(item) == "숙소"]
+    activity_items = [item for item in selected if place_category(item) != "숙소"]
+    activity_items = sorted(activity_items, key=lambda item: candidate_priority(item, route_type))
+    activity_items = reorder_to_reduce_repetition(activity_items)
+
+    # 점심 코스는 가능하면 카페가 아닌 곳으로 시작합니다.
+    if preferences.get("meal_time") == "점심" and activity_items and place_category(activity_items[0]) == "카페":
+        non_cafe_index = next(
+            (index for index, item in enumerate(activity_items) if place_category(item) != "카페"),
+            None,
+        )
+        if non_cafe_index not in (None, 0):
+            activity_items[0], activity_items[non_cafe_index] = activity_items[non_cafe_index], activity_items[0]
+
+    # 숙소는 대실·휴식 또는 숙박으로 이어지도록 코스 마지막에 둡니다.
+    result = activity_items + lodging_items[:1]
+    return [complete(item) for item in result[:target_count]]
+
+
+def balanced_greedy_order(
+    points: list[dict[str, Any]],
+    start: dict[str, Any] | None,
+    end: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """가까운 동선을 우선하되 가능한 경우 같은 카테고리를 연속 배치하지 않습니다."""
+    if len(points) <= 1:
+        return points
+
+    remaining = points.copy()
+    ordered: list[dict[str, Any]] = []
+    current = start if start and start.get("lat") is not None else None
+    previous_category = place_category(start or {})
+
+    while remaining:
+        different = [item for item in remaining if place_category(item) != previous_category]
+        choices = different or remaining
+
+        if current is None:
+            next_item = min(
+                choices,
+                key=lambda item: point_distance(item, end) if end else candidate_priority(item, "가까운 동네"),
+            )
+        else:
+            next_item = min(choices, key=lambda item: point_distance(current, item))
+
+        ordered.append(next_item)
+        remaining.remove(next_item)
+        current = next_item
+        previous_category = place_category(next_item)
+
+    return ordered
+
+
+def distribute_activities_around_meal(
+    activities: list[dict[str, Any]],
+    meal_time: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """카페가 식사 전후 한쪽에 몰리지 않도록 활동 장소를 나눕니다."""
+    if not activities:
+        return [], []
+
+    before_count = split_before_count(meal_time, len(activities))
+    cafes = [item for item in activities if place_category(item) == "카페"]
+    non_cafes = [item for item in activities if place_category(item) != "카페"]
+
+    if meal_time == "점심" and before_count > 0 and len(cafes) >= 2 and non_cafes:
+        before = [cafes[0]]
+        remaining = non_cafes + cafes[1:]
+        before.extend(remaining[: max(0, before_count - 1)])
+        used_names = {str(item.get("name") or item.get("이름") or "") for item in before}
+        after = [item for item in activities if str(item.get("name") or item.get("이름") or "") not in used_names]
+    elif meal_time == "저녁" and cafes and len(activities) - before_count > 0:
+        after = [cafes[-1]]
+        used_names = {str(item.get("name") or item.get("이름") or "") for item in after}
+        remaining = [item for item in activities if str(item.get("name") or item.get("이름") or "") not in used_names]
+        before = remaining[:before_count]
+        after = remaining[before_count:] + after
+    else:
+        ordered = reorder_to_reduce_repetition(activities)
+        before = ordered[:before_count]
+        after = ordered[before_count:]
+
+    return reorder_to_reduce_repetition(before), reorder_to_reduce_repetition(after)
 
 def assemble_routes(
     raw_routes: list[dict[str, Any]],
@@ -911,7 +1102,7 @@ def assemble_routes(
                     **item,
                     "name": name,
                     "address": str(item.get("address") or item.get("주소") or ""),
-                    "category": str(item.get("category") or item.get("카테고리") or "장소"),
+                    "category": place_category(item),
                     "reason": str(item.get("reason") or fallback_summary(route_type, preferences["companion"])),
                 }
             )
@@ -923,11 +1114,15 @@ def assemble_routes(
         if not selected:
             continue
 
-        before_count = split_before_count(preferences["meal_time"], len(selected))
-        before = selected[:before_count]
-        after = selected[before_count:]
-        before = greedy_order(before, origin, restaurant)
-        after = greedy_order(after, restaurant, None)
+        lodging_places = [item for item in selected if place_category(item) == "숙소"]
+        activity_places = [item for item in selected if place_category(item) != "숙소"]
+
+        before, after = distribute_activities_around_meal(
+            activity_places,
+            preferences["meal_time"],
+        )
+        before = balanced_greedy_order(before, origin, restaurant)
+        after = balanced_greedy_order(after, restaurant, None)
 
         stops: list[dict[str, Any]] = []
         for item in before:
@@ -969,6 +1164,23 @@ def assemble_routes(
                 }
             )
 
+        if lodging_places:
+            lodging = lodging_places[0]
+            stops.append(
+                {
+                    **lodging,
+                    "phase": "숙소·휴식",
+                    "stay_minutes": parse_minutes(
+                        optional_text(lodging, "체류시간", "예상체류시간", "소요시간"),
+                        int(config.get("lodging_stay") or 90),
+                    ),
+                    "reason": str(
+                        lodging.get("reason")
+                        or "코스 마지막에 대실·휴식 또는 숙박으로 연결할 수 있는 숙소예요."
+                    ),
+                }
+            )
+
         route = {
             "route_type": route_type,
             "title": str(raw.get("title") or fallback_title(route_type, preferences["companion"])),
@@ -984,12 +1196,14 @@ def assemble_routes(
             "origin": origin if origin and origin.get("ok") else None,
             "stops": stops,
             "source": source,
+            "includes_lodging": bool(lodging_places),
         }
         route["estimated_minutes"] = estimate_route_minutes(route["origin"], stops)
         route["id"] = route_id(route)
         routes.append(route)
 
     return routes
+
 
 
 def create_recommendations(
@@ -1416,6 +1630,7 @@ def inject_css() -> None:
 
         html, body, [data-testid="stAppViewContainer"] {
             overflow-x: hidden !important;
+            scroll-padding-bottom: calc(13rem + env(safe-area-inset-bottom));
         }
 
         [data-testid="stAppViewContainer"] {
@@ -1434,7 +1649,7 @@ def inject_css() -> None:
             width: 100% !important;
             max-width: 470px !important;
             min-height: 100vh;
-            padding: 1rem 1rem calc(10rem + env(safe-area-inset-bottom)) !important;
+            padding: 1rem 1rem calc(14.5rem + env(safe-area-inset-bottom)) !important;
             background: var(--paper);
             box-shadow: 0 0 50px rgba(25,55,47,.13);
         }
@@ -1580,6 +1795,7 @@ def inject_css() -> None:
             background: var(--g100); color: var(--g800); font-size: .57rem; font-weight: 950;
         }
         .phase.food { background: #fff0ec; color: #c24f36; }
+        .phase.lodging { background: #f0edff; color: #6551b8; }
         .stop-time { color: var(--muted); font-size: .59rem; text-align: right; }
         .stop-card h3 { margin: .43rem 0 .22rem; color: var(--ink); font-size: .92rem; overflow-wrap: anywhere; }
         .stop-card p { margin: 0; color: #51615b; font-size: .68rem; line-height: 1.5; overflow-wrap: anywhere; }
@@ -1603,13 +1819,13 @@ def inject_css() -> None:
         /* 카메라 위젯은 높이·overflow를 강제로 제한하지 않는다. */
         [data-testid="stCameraInput"] { border-radius: 1rem; }
 
-        .safe-space { height: 7.5rem; }
+        .safe-space { height: calc(13rem + env(safe-area-inset-bottom)); }
         .st-key-bottom_nav_shell {
             position: fixed !important; left: 50% !important;
-            bottom: max(.5rem, env(safe-area-inset-bottom)) !important;
+            bottom: calc(.45rem + env(safe-area-inset-bottom)) !important;
             transform: translateX(-50%) !important; z-index: 99999 !important;
             width: min(438px, calc(100vw - 1.1rem)) !important;
-            padding: .4rem !important; border: 1px solid rgba(204,220,214,.96) !important;
+            padding: .3rem !important; border: 1px solid rgba(204,220,214,.96) !important;
             border-radius: 1.18rem !important; background: rgba(255,255,255,.96) !important;
             box-shadow: 0 15px 36px rgba(29,57,49,.2) !important;
             backdrop-filter: blur(16px);
@@ -1617,14 +1833,14 @@ def inject_css() -> None:
         .st-key-bottom_nav_shell [data-testid="stVerticalBlock"] { gap: 0 !important; }
         .st-key-bottom_nav_shell [data-testid="column"] { padding: 0 .1rem !important; }
         .st-key-bottom_nav_shell .stButton > button {
-            min-height: 3rem !important; padding: .35rem .1rem !important;
+            min-height: 2.7rem !important; padding: .28rem .08rem !important;
             font-size: .64rem !important; border-radius: .8rem !important;
         }
 
         @media (max-width: 640px) {
             [data-testid="stMainBlockContainer"], .block-container {
                 max-width: none !important;
-                padding: .8rem .82rem calc(9.5rem + env(safe-area-inset-bottom)) !important;
+                padding: .8rem .82rem calc(16rem + env(safe-area-inset-bottom)) !important;
                 box-shadow: none;
             }
             .hero h1 { font-size: 1.5rem; }
@@ -1824,7 +2040,7 @@ def page_home(places: pd.DataFrame) -> None:
         <div class="hero">
             <small>전남광주 AI 로컬 미식 코스</small>
             <h1>오늘 갈 식당을 고르면<br>주변 여행 동선이 완성돼요.</h1>
-            <p>동행과 취향, 가능한 시간을 반영해 관광지·문화공간·카페를 자연스럽게 연결합니다.</p>
+            <p>동행과 취향, 가능한 시간을 반영해 관광지·문화공간·카페와 반나절 이상 코스의 숙소까지 자연스럽게 연결합니다.</p>
         </div>
         """
     )
@@ -1924,6 +2140,21 @@ def page_home(places: pd.DataFrame) -> None:
             value="3시간",
             key="home_course_label",
         )
+
+        if lodging_enabled(course_label):
+            lodging_count = len(
+                places[
+                    (places["지역"] == region)
+                    & (places["카테고리"] == "숙소")
+                ]
+            )
+            if lodging_count:
+                st.caption(
+                    f"🏨 반나절 이상 코스에는 등록된 숙소 {lodging_count}곳 중 "
+                    "가까운 1곳을 대실·휴식 또는 숙박 후보로 포함해요."
+                )
+            else:
+                st.caption("🏨 이 지역에 등록된 숙소가 없어 기존 장소들로 코스를 구성해요.")
 
         start_time_value = st.time_input(
             "코스 시작 시간",
@@ -2065,17 +2296,21 @@ def render_origin(origin: dict[str, Any], start_time_text: str) -> None:
 
 def render_stop(stop: dict[str, Any]) -> None:
     """장소 카드에 필요한 값이 일부 없더라도 화면이 중단되지 않게 표시합니다."""
-    category = str(stop.get("category") or stop.get("카테고리") or "장소").strip()
+    category = place_category(stop)
     name = str(stop.get("name") or stop.get("이름") or "이름 없는 장소").strip()
     address = str(stop.get("address") or stop.get("주소") or "").strip()
     phase = str(stop.get("phase") or "추천 장소").strip()
     stay_minutes = int(stop.get("stay_minutes") or 30)
     reason = str(
         stop.get("reason")
-        or "선택한 조건과 동선을 고려해 추천한 장소예요."
+        or (
+            "대실·휴식 또는 숙박으로 코스를 편안하게 마무리할 수 있는 숙소예요."
+            if category == "숙소"
+            else "선택한 조건과 동선을 고려해 추천한 장소예요."
+        )
     ).strip()
 
-    css_class = "food" if category == "맛집" else ""
+    css_class = "food" if category == "맛집" else "lodging" if category == "숙소" else ""
     image_src = preview_image_data_uri(str(stop.get("_preview_path") or ""))
     if image_src:
         preview_html = (
@@ -2108,6 +2343,7 @@ def render_stop(stop: dict[str, Any]) -> None:
         </div>
         """
     )
+
 
 
 def regenerate_course(places: pd.DataFrame) -> None:
@@ -2226,6 +2462,14 @@ def page_course(places: pd.DataFrame) -> None:
 # 체크인
 # -----------------------------------------------------------------------------
 
+def clear_qr_feedback() -> None:
+    """새 장소·입력 방식·새 QR을 선택할 때 이전 결과 메시지를 즉시 지웁니다."""
+    st.session_state.qr_feedback = None
+    st.session_state.qr_last_input_sig = ""
+
+
+
+
 def page_checkin() -> None:
     route = active_route() or (st.session_state.saved[0] if st.session_state.saved else None)
     if route is None:
@@ -2238,7 +2482,12 @@ def page_checkin() -> None:
     if st.session_state.get("checkin_place") not in names:
         st.session_state.checkin_place = names[0]
 
-    selected_name = st.selectbox("체크인할 장소", names, key="checkin_place")
+    selected_name = st.selectbox(
+        "체크인할 장소",
+        names,
+        key="checkin_place",
+        on_change=clear_qr_feedback,
+    )
     stop = next(item for item in route["stops"] if item["name"] == selected_name)
 
     ui(
@@ -2251,23 +2500,12 @@ def page_checkin() -> None:
         """
     )
 
-    feedback = st.session_state.get("qr_feedback")
-    if isinstance(feedback, dict):
-        if feedback.get("kind") == "success":
-            st.success(str(feedback.get("message") or "체크인에 성공했어요."))
-        elif feedback.get("kind") == "cooldown":
-            st.warning(str(feedback.get("message") or "QR 쿨타임이 남아 있어요."))
-        else:
-            st.error(str(feedback.get("message") or "QR을 확인하지 못했어요."))
+    # 이 위치를 먼저 확보하고, 현재 입력값을 확인한 뒤 최신 메시지만 채웁니다.
+    feedback_slot = st.empty()
 
-    ui(
-        f"""
-        <div class="qr-rule">
-            <strong>QR 체크인 이용 안내</strong>
-            같은 QR은 체크인 후 {QR_COOLDOWN_SECONDS}초 동안 다시 사용할 수 없습니다.
-            다른 시연용 QR은 바로 사용할 수 있어요.
-        </div>
-        """
+    st.caption(
+        f"같은 QR은 체크인 후 {QR_COOLDOWN_SECONDS}초가 지나야 다시 사용할 수 있어요. "
+        "다른 시연용 QR은 바로 사용할 수 있습니다."
     )
 
     cooldowns = active_qr_cooldowns()
@@ -2284,6 +2522,7 @@ def page_checkin() -> None:
         default="QR 이미지 업로드",
         key="qr_input_method",
         width="stretch",
+        on_change=clear_qr_feedback,
     ) or "QR 이미지 업로드"
 
     nonce = int(st.session_state.qr_widget_nonce)
@@ -2315,6 +2554,16 @@ def page_checkin() -> None:
                 st.session_state.qr_feedback = None
                 st.session_state.qr_last_input_sig = current_sig
 
+    # 새 QR이 선택된 뒤에 메시지를 그리므로 직전 QR의 경고가 화면에 남지 않습니다.
+    feedback = st.session_state.get("qr_feedback")
+    if isinstance(feedback, dict):
+        if feedback.get("kind") == "success":
+            feedback_slot.success(str(feedback.get("message") or "체크인에 성공했어요."))
+        elif feedback.get("kind") == "cooldown":
+            feedback_slot.warning(str(feedback.get("message") or "QR 쿨타임이 남아 있어요."))
+        else:
+            feedback_slot.error(str(feedback.get("message") or "QR을 확인하지 못했어요."))
+
     if image_bytes is not None:
         if st.button(
             "QR 체크인 확인",
@@ -2336,6 +2585,7 @@ def page_checkin() -> None:
         </div>
         """
     )
+
 
 # -----------------------------------------------------------------------------
 # MY

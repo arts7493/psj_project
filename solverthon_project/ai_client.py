@@ -224,9 +224,36 @@ def _schema(place_count: int, candidate_ids: Sequence[str]) -> dict[str, Any]:
     }
 
 
-def _build_prompt(*, region: str, restaurant: str, course_label: str, course_minutes: int, companion: str, meal_time: str, interests: Sequence[str], candidates: Sequence[dict[str, Any]], place_count: int, variation: int, compact_retry: bool) -> str:
+def _build_prompt(
+    *,
+    region: str,
+    restaurant: str,
+    course_label: str,
+    course_minutes: int,
+    companion: str,
+    meal_time: str,
+    interests: Sequence[str],
+    candidates: Sequence[dict[str, Any]],
+    place_count: int,
+    variation: int,
+    compact_retry: bool,
+) -> str:
     interest_text = ", ".join(interests) if interests else "특별히 없음"
-    candidate_json = json.dumps(list(candidates), ensure_ascii=False, separators=(",", ":") if compact_retry else None)
+    candidate_json = json.dumps(
+        list(candidates),
+        ensure_ascii=False,
+        separators=(",", ":") if compact_retry else None,
+    )
+    lodging_available = any(
+        str(item.get("category") or "") == "숙소" for item in candidates
+    )
+    lodging_rule = (
+        "반나절·하루 코스이므로 숙소 후보가 있으면 각 코스에 숙소를 정확히 1곳 넣고 place_ids의 마지막에 둔다. "
+        "숙소는 대실·휴식 또는 숙박 연결 용도다."
+        if course_label in {"반나절", "하루"} and lodging_available
+        else "2시간·3시간 코스에는 숙소를 선택하지 않는다."
+    )
+
     base = f"""
 너는 전남광주 로컬 미식 코스 큐레이터다.
 
@@ -257,14 +284,25 @@ def _build_prompt(*, region: str, restaurant: str, course_label: str, course_min
 - 2시간·3시간 코스는 카페를 최대 1곳까지만 고른다.
 - 반나절·하루 코스는 카페를 최대 2곳까지만 고른다.
 - 카페만 반복하지 말고 가능한 경우 관광명소 또는 문화공간을 반드시 1곳 이상 포함한다.
-- 식사 전후 코스는 같은 카테고리만 반복하지 않는다.
+- 같은 카테고리만 연속해서 선택하지 않는다.
+- {lodging_rule}
 
 후보:
 {candidate_json}
 """.strip()
+
     if compact_retry:
-        base += '\nJSON만 출력한다. 형식:{"routes":[{"route_type":"가까운 동네","title":"제목","summary":"요약","place_ids":["P01"],"reasons":["이유"]},{"route_type":"취향 집중","title":"제목","summary":"요약","place_ids":["P02"],"reasons":["이유"]},{"route_type":"식사 전후","title":"제목","summary":"요약","place_ids":["P03"],"reasons":["이유"]}]}'
+        base += (
+            '\nJSON만 출력한다. 형식:'
+            '{"routes":['
+            '{"route_type":"가까운 동네","title":"제목","summary":"요약","place_ids":["P01"],"reasons":["이유"]},'
+            '{"route_type":"취향 집중","title":"제목","summary":"요약","place_ids":["P02"],"reasons":["이유"]},'
+            '{"route_type":"식사 전후","title":"제목","summary":"요약","place_ids":["P03"],"reasons":["이유"]}'
+            ']}'
+        )
+
     return base
+
 
 
 def _extract_output_text(interaction: Any) -> str:
@@ -357,13 +395,43 @@ def _safe_text(value: Any, fallback: str, companion: str, limit: int) -> str:
     return text[:limit].rstrip()
 
 
-def _candidate_fill_order(route_type: str, candidates: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+def _candidate_fill_order(
+    route_type: str,
+    candidates: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
     if route_type == "가까운 동네":
-        return sorted(candidates, key=lambda item: (not bool(item.get("same_area") or item.get("same_subregion")), item.get("distance_km") is None, float(item.get("distance_km") or 9999)))
+        return sorted(
+            candidates,
+            key=lambda item: (
+                str(item.get("category") or "") == "숙소",
+                not bool(item.get("same_area") or item.get("same_subregion")),
+                item.get("distance_km") is None,
+                float(item.get("distance_km") or 9999),
+            ),
+        )
+
     if route_type == "취향 집중":
-        return sorted(candidates, key=lambda item: (-int(item.get("interest_score") or 0), -int(item.get("companion_score") or 0), item.get("distance_km") is None, float(item.get("distance_km") or 9999)))
-    category_order = {"관광명소": 0, "문화공간": 1, "카페": 2}
-    return sorted(candidates, key=lambda item: (category_order.get(str(item.get("category")), 9), item.get("distance_km") is None, float(item.get("distance_km") or 9999)))
+        return sorted(
+            candidates,
+            key=lambda item: (
+                str(item.get("category") or "") == "숙소",
+                -int(item.get("interest_score") or 0),
+                -int(item.get("companion_score") or 0),
+                item.get("distance_km") is None,
+                float(item.get("distance_km") or 9999),
+            ),
+        )
+
+    category_order = {"관광명소": 0, "문화공간": 1, "카페": 2, "숙소": 3}
+    return sorted(
+        candidates,
+        key=lambda item: (
+            category_order.get(str(item.get("category")), 9),
+            item.get("distance_km") is None,
+            float(item.get("distance_km") or 9999),
+        ),
+    )
+
 
 
 def _max_cafe_count(course_label: str) -> int:
@@ -374,34 +442,142 @@ def _category_of(item: dict[str, Any]) -> str:
     return str(item.get("category") or item.get("카테고리") or "장소")
 
 
-def _balance_selected_ids(selected_ids: list[str], prepared: Sequence[dict[str, Any]], route_type: str, course_label: str) -> list[str]:
+def _balance_selected_ids(
+    selected_ids: list[str],
+    prepared: Sequence[dict[str, Any]],
+    route_type: str,
+    course_label: str,
+) -> list[str]:
     compact_by_id = {str(item["id"]): item for item in prepared}
     selected_ids = [candidate_id for candidate_id in selected_ids if candidate_id in compact_by_id]
-    limit = _max_cafe_count(course_label)
+    target_count = len(selected_ids)
+    cafe_limit = _max_cafe_count(course_label)
+    lodging_candidates = [
+        item for item in prepared if _category_of(item) == "숙소"
+    ]
+    lodging_required = course_label in {"반나절", "하루"} and bool(lodging_candidates)
 
-    def selected_items() -> list[dict[str, Any]]:
-        return [compact_by_id[candidate_id] for candidate_id in selected_ids if candidate_id in compact_by_id]
+    def current_items() -> list[dict[str, Any]]:
+        return [compact_by_id[candidate_id] for candidate_id in selected_ids]
 
-    extras = [i for i, candidate_id in enumerate(selected_ids) if _category_of(compact_by_id[candidate_id]) == "카페"]
-    if len(extras) > limit:
-        replacements = [item for item in _candidate_fill_order(route_type, prepared) if _category_of(item) != "카페" and str(item["id"]) not in selected_ids]
-        for index in extras[limit:]:
-            if not replacements:
-                break
-            selected_ids[index] = str(replacements.pop(0)["id"])
+    def available(predicate: Any) -> list[dict[str, Any]]:
+        return [
+            item for item in _candidate_fill_order(route_type, prepared)
+            if str(item["id"]) not in selected_ids and predicate(item)
+        ]
 
-    selected_set = set(selected_ids)
-    if not any(_category_of(item) in {"관광명소", "문화공간"} for item in selected_items()):
-        scenic = [item for item in _candidate_fill_order(route_type, prepared) if _category_of(item) in {"관광명소", "문화공간"} and str(item["id"]) not in selected_set]
-        if scenic and selected_ids:
-            replace_index = next((i for i, candidate_id in enumerate(selected_ids) if _category_of(compact_by_id[candidate_id]) == "카페"), len(selected_ids) - 1)
-            selected_ids[replace_index] = str(scenic[0]["id"])
+    # 짧은 코스에서는 숙소를 제거합니다.
+    if not lodging_required:
+        for index, candidate_id in list(enumerate(selected_ids)):
+            if _category_of(compact_by_id[candidate_id]) != "숙소":
+                continue
+            replacements = available(lambda item: _category_of(item) != "숙소")
+            if replacements:
+                selected_ids[index] = str(replacements[0]["id"])
 
+    # 반나절·하루에는 숙소 후보가 있으면 정확히 1곳을 포함하고 마지막에 둡니다.
+    if lodging_required:
+        lodging_ids = [
+            candidate_id for candidate_id in selected_ids
+            if _category_of(compact_by_id[candidate_id]) == "숙소"
+        ]
+        chosen_lodging = lodging_ids[0] if lodging_ids else str(
+            sorted(
+                lodging_candidates,
+                key=lambda item: (
+                    item.get("distance_km") is None,
+                    float(item.get("distance_km") or 9999),
+                ),
+            )[0]["id"]
+        )
+        selected_ids = [
+            candidate_id for candidate_id in selected_ids
+            if _category_of(compact_by_id[candidate_id]) != "숙소"
+        ]
+        selected_ids = selected_ids[: max(0, target_count - 1)] + [chosen_lodging]
+
+    # 카페 과다를 비카페 활동으로 교체합니다. 숙소는 카페 대체 대상으로 사용하지 않습니다.
+    cafe_indices = [
+        index for index, candidate_id in enumerate(selected_ids)
+        if _category_of(compact_by_id[candidate_id]) == "카페"
+    ]
+    if len(cafe_indices) > cafe_limit:
+        replacements = available(
+            lambda item: _category_of(item) not in {"카페", "숙소"}
+        )
+        for index in cafe_indices[cafe_limit:]:
+            if replacements:
+                selected_ids[index] = str(replacements.pop(0)["id"])
+            else:
+                selected_ids[index] = ""
+        selected_ids = [candidate_id for candidate_id in selected_ids if candidate_id]
+
+    # 관광명소 또는 문화공간이 있다면 최소 한 곳 포함합니다.
+    if not any(
+        _category_of(item) in {"관광명소", "문화공간"}
+        for item in current_items()
+    ):
+        scenic = available(
+            lambda item: _category_of(item) in {"관광명소", "문화공간"}
+        )
+        if scenic:
+            replace_index = next(
+                (
+                    index for index, candidate_id in enumerate(selected_ids)
+                    if _category_of(compact_by_id[candidate_id]) == "카페"
+                ),
+                next(
+                    (
+                        index for index in range(len(selected_ids) - 1, -1, -1)
+                        if _category_of(compact_by_id[selected_ids[index]]) != "숙소"
+                    ),
+                    None,
+                ),
+            )
+            if replace_index is not None:
+                selected_ids[replace_index] = str(scenic[0]["id"])
+
+    # 중복을 제거하고 부족분을 채웁니다.
     deduped: list[str] = []
     for candidate_id in selected_ids:
         if candidate_id not in deduped:
             deduped.append(candidate_id)
-    return deduped
+    selected_ids = deduped
+
+    while len(selected_ids) < target_count:
+        cafe_count = sum(
+            1 for candidate_id in selected_ids
+            if _category_of(compact_by_id[candidate_id]) == "카페"
+        )
+        candidate = next(
+            (
+                item for item in _candidate_fill_order(route_type, prepared)
+                if str(item["id"]) not in selected_ids
+                and not (_category_of(item) == "카페" and cafe_count >= cafe_limit)
+                and not (
+                    _category_of(item) == "숙소"
+                    and any(_category_of(compact_by_id[value]) == "숙소" for value in selected_ids)
+                )
+            ),
+            None,
+        )
+        if candidate is None:
+            break
+        selected_ids.append(str(candidate["id"]))
+
+    if lodging_required:
+        lodging_ids = [
+            candidate_id for candidate_id in selected_ids
+            if _category_of(compact_by_id[candidate_id]) == "숙소"
+        ]
+        non_lodging_ids = [
+            candidate_id for candidate_id in selected_ids
+            if _category_of(compact_by_id[candidate_id]) != "숙소"
+        ]
+        selected_ids = non_lodging_ids + lodging_ids[:1]
+
+    return selected_ids[:target_count]
+
 
 
 def _validate_routes(payload: dict[str, Any], prepared: Sequence[dict[str, Any]], original_by_id: dict[str, dict[str, Any]], place_count: int, companion: str, course_label: str) -> tuple[list[dict[str, Any]], int, list[str]]:
@@ -554,6 +730,9 @@ def generate_gemini_routes(*, region: str, restaurant: str, course_label: str, c
             message = f"{type(exc).__name__}: {exc}"
             errors.append(f"{spec['name']}: {message}")
             attempts.append({"name": spec["name"], "success": False, "latency_seconds": round(latency, 2), "error": message})
+            lowered = message.lower()
+            if "429" in lowered or "quota" in lowered or "rate limit" in lowered or "too_many_requests" in lowered:
+                break
 
     total_latency = time.perf_counter() - total_started
     if payload is None:
