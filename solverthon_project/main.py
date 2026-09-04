@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-from ai_client import generate_gemini_routes, get_gemini_status
+from ai_client import generate_ai_routes, get_ai_status
 from naver_map import (
     build_naver_search_url,
     clear_map_cache,
@@ -33,6 +33,7 @@ from qr_utils import (
     get_demo_qr_info,
 )
 from place_images import attach_preview_images, preview_image_data_uri
+from live_qr import LiveQRScanner, render_live_qr_camera
 
 
 APP_NAME = "운남화이팅"
@@ -110,6 +111,22 @@ INTEREST_CATEGORY = {
     "카페·디저트": "카페",
     "로컬 감성": "관광명소",
 }
+
+
+AI_PROVIDER_OPTIONS = ("Gemini", "ChatGPT")
+AI_PROVIDER_IDS = {
+    "Gemini": "gemini",
+    "ChatGPT": "openai",
+}
+AI_PROVIDER_NAMES = {
+    "gemini": "Gemini",
+    "openai": "ChatGPT",
+    "python": "기본 추천",
+}
+
+
+def ai_provider_name(value: Any) -> str:
+    return AI_PROVIDER_NAMES.get(str(value or "").lower().strip(), "AI")
 
 
 st.set_page_config(
@@ -339,11 +356,22 @@ def init_state() -> None:
         "qr_widget_nonce": 0,
         "qr_feedback": None,
         "qr_last_input_sig": "",
+        "live_qr_consumed_event": 0,
+        "live_qr_scanner_route": "",
+        "course_view_mode": "generated",
+        "opened_saved_route_id": "",
+        "saved_route_notice": "",
+        "saved_route_error": "",
     }
 
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = deepcopy(value)
+
+    scanner = st.session_state.get("live_qr_scanner")
+    if scanner is None or type(scanner).__name__ != LiveQRScanner.__name__:
+        st.session_state.live_qr_scanner = LiveQRScanner()
+        st.session_state.live_qr_consumed_event = 0
 
     if st.session_state.page not in NAV_ITEMS:
         st.session_state.page = HOME
@@ -813,7 +841,7 @@ def estimate_route_minutes(origin: dict[str, Any] | None, stops: list[dict[str, 
 
 def route_id(route: dict[str, Any]) -> str:
     names = "|".join(stop["name"] for stop in route["stops"])
-    raw = f"{route['region']}|{route['route_type']}|{route['title']}|{names}"
+    raw = f"{route['region']}|{route.get('ai_provider', route.get('source', ''))}|{route['route_type']}|{route['title']}|{names}"
     return sha1(raw.encode("utf-8")).hexdigest()[:14]
 
 
@@ -1196,6 +1224,7 @@ def assemble_routes(
             "origin": origin if origin and origin.get("ok") else None,
             "stops": stops,
             "source": source,
+            "ai_provider": preferences.get("ai_provider", source if source in {"gemini", "openai"} else "gemini"),
             "includes_lodging": bool(lodging_places),
         }
         route["estimated_minutes"] = estimate_route_minutes(route["origin"], stops)
@@ -1203,6 +1232,7 @@ def assemble_routes(
         routes.append(route)
 
     return routes
+
 
 
 
@@ -1240,7 +1270,12 @@ def create_recommendations(
         len(candidates),
     )
 
-    result = generate_gemini_routes(
+    requested_provider = str(preferences.get("ai_provider") or "gemini").lower().strip()
+    if requested_provider not in {"gemini", "openai"}:
+        requested_provider = "gemini"
+
+    result = generate_ai_routes(
+        provider=requested_provider,
         region=preferences["region"],
         restaurant=restaurant_name,
         course_label=preferences["course_label"],
@@ -1260,13 +1295,14 @@ def create_recommendations(
             candidates,
             preferences,
             origin,
-            "gemini",
+            requested_provider,
         )
         if routes:
             return (
                 routes,
                 {
-                    "source": "gemini",
+                    "source": requested_provider,
+                    "provider": requested_provider,
                     "model": result.get("model", ""),
                     "latency_seconds": result.get("latency_seconds", 0.0),
                     "repair_count": result.get("repair_count", 0),
@@ -1290,11 +1326,15 @@ def create_recommendations(
         routes,
         {
             "source": "python",
+            "provider": requested_provider,
             "model": result.get("model", ""),
             "latency_seconds": result.get("latency_seconds", 0.0),
             "repair_count": 0,
             "attempts": result.get("attempts", []),
-            "error": result.get("error", "Gemini 추천을 적용하지 못했습니다."),
+            "error": result.get(
+                "error",
+                f"{ai_provider_name(requested_provider)} 추천을 적용하지 못했습니다.",
+            ),
             "timed_out": bool(result.get("timed_out")),
         },
         map_meta,
@@ -1306,6 +1346,63 @@ def active_route() -> dict[str, Any] | None:
         return None
     index = max(0, min(st.session_state.route_index, len(st.session_state.routes) - 1))
     return st.session_state.routes[index]
+
+
+def clear_course_selector_state() -> None:
+    """이전 코스 선택 위젯의 상태가 저장 코스 화면에 남지 않도록 정리합니다."""
+    for key in list(st.session_state.keys()):
+        if str(key).startswith("route_type_"):
+            del st.session_state[key]
+
+
+def mark_generated_course_view() -> None:
+    """새 추천 또는 재추천 결과를 일반 코스 화면으로 전환합니다."""
+    st.session_state.course_view_mode = "generated"
+    st.session_state.opened_saved_route_id = ""
+    st.session_state.saved_route_notice = ""
+    st.session_state.saved_route_error = ""
+    clear_course_selector_state()
+
+
+def find_saved_route(route_id_value: str) -> dict[str, Any] | None:
+    """세션에 저장된 코스를 ID로 다시 찾아 안전한 복사본을 반환합니다."""
+    target_id = str(route_id_value or "").strip()
+    for item in st.session_state.saved:
+        if str(item.get("id") or "") == target_id:
+            return deepcopy(item)
+    return None
+
+
+def sync_opened_saved_route() -> None:
+    """
+    MY에서 선택한 저장 코스를 코스 화면의 유일한 활성 코스로 고정합니다.
+
+    페이지 전환 과정에서 이전 추천 목록이 다시 남더라도 저장 코스 ID를 기준으로
+    정확한 대상을 복원하므로 마지막으로 보던 코스가 나타나는 문제를 방지합니다.
+    """
+    if st.session_state.course_view_mode != "saved":
+        return
+
+    route_id_value = str(st.session_state.opened_saved_route_id or "").strip()
+    if not route_id_value:
+        st.session_state.course_view_mode = "generated"
+        return
+
+    target = find_saved_route(route_id_value)
+    if target is None:
+        st.session_state.saved_route_error = "저장한 코스를 찾지 못했습니다. MY에서 다시 선택해 주세요."
+        st.session_state.course_view_mode = "generated"
+        st.session_state.opened_saved_route_id = ""
+        return
+
+    current_id = ""
+    if len(st.session_state.routes) == 1:
+        current_id = str(st.session_state.routes[0].get("id") or "")
+
+    if current_id != route_id_value:
+        st.session_state.routes = [target]
+
+    st.session_state.route_index = 0
 
 
 def save_active_route() -> None:
@@ -1516,36 +1613,31 @@ def render_stop_actions(
 # -----------------------------------------------------------------------------
 # 카메라
 # -----------------------------------------------------------------------------
+
 def qr_scan_event_id(payload: str, scanned_at: datetime, place_name: str) -> str:
     raw = f"{payload}|{scanned_at.isoformat()}|{place_name}"
     return sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
-
-def attempt_qr_checkin(stop: dict[str, Any], image_bytes: bytes) -> dict[str, Any]:
-    """업로드 또는 카메라 이미지의 시연용 QR을 확인하고 포인트를 적립합니다."""
-    decoded = decode_qr_image(image_bytes)
-    if not decoded.get("ok"):
-        st.session_state.qr_widget_nonce += 1
-        return {
-            "kind": "error",
-            "message": str(decoded.get("error") or "QR 코드를 읽지 못했습니다."),
-        }
-
-    payload = str(decoded.get("payload") or "").strip()
-    qr_info = get_demo_qr_info(payload)
+def register_qr_payload(
+    stop: dict[str, Any],
+    payload: str,
+    *,
+    image_hash: str = "live-camera",
+) -> dict[str, Any]:
+    """이미 해석된 QR 문자열을 검사하고 쿨타임과 포인트를 적용합니다."""
+    normalized_payload = str(payload or "").strip()
+    qr_info = get_demo_qr_info(normalized_payload)
     if qr_info is None:
-        st.session_state.qr_widget_nonce += 1
         return {
             "kind": "error",
-            "message": "운남화이팅 시연용 QR이 아닙니다. 제공된 시연용 QR 이미지를 사용해 주세요.",
+            "message": "운남화이팅 시연용 QR이 아닙니다. 제공된 시연용 QR을 사용해 주세요.",
         }
 
     now = datetime.now(KST)
-    last_scanned_at = st.session_state.qr_last_scan.get(payload)
+    last_scanned_at = st.session_state.qr_last_scan.get(normalized_payload)
     remaining = cooldown_remaining(last_scanned_at, now=now)
     if remaining > 0:
-        st.session_state.qr_widget_nonce += 1
         return {
             "kind": "cooldown",
             "message": (
@@ -1557,22 +1649,24 @@ def attempt_qr_checkin(stop: dict[str, Any], image_bytes: bytes) -> dict[str, An
         }
 
     points = int(qr_info.get("points") or 100)
-    st.session_state.qr_last_scan[payload] = now.isoformat()
+    place_name = str(stop.get("name") or stop.get("이름") or "체크인 장소")
+    category = place_category(stop)
+
+    st.session_state.qr_last_scan[normalized_payload] = now.isoformat()
     st.session_state.checkins.insert(
         0,
         {
-            "id": qr_scan_event_id(payload, now, stop["name"]),
+            "id": qr_scan_event_id(normalized_payload, now, place_name),
             "qr_code": qr_info["code"],
             "qr_label": qr_info["label"],
-            "name": stop["name"],
-            "category": stop["category"],
+            "name": place_name,
+            "category": category,
             "checked_at": now.strftime("%m.%d %H:%M:%S"),
             "points": points,
-            "image_hash": sha256(image_bytes).hexdigest()[:12],
+            "image_hash": str(image_hash or "live-camera")[:40],
         },
     )
     st.session_state.points += points
-    st.session_state.qr_widget_nonce += 1
 
     return {
         "kind": "success",
@@ -1580,6 +1674,23 @@ def attempt_qr_checkin(stop: dict[str, Any], image_bytes: bytes) -> dict[str, An
         "points": points,
         "qr_code": qr_info["code"],
     }
+
+
+def attempt_qr_checkin(stop: dict[str, Any], image_bytes: bytes) -> dict[str, Any]:
+    """업로드 이미지에서 QR을 읽고 체크인합니다."""
+    decoded = decode_qr_image(image_bytes)
+    st.session_state.qr_widget_nonce += 1
+    if not decoded.get("ok"):
+        return {
+            "kind": "error",
+            "message": str(decoded.get("error") or "QR 코드를 읽지 못했습니다."),
+        }
+
+    return register_qr_payload(
+        stop,
+        str(decoded.get("payload") or ""),
+        image_hash=sha256(image_bytes).hexdigest()[:12],
+    )
 
 
 def active_qr_cooldowns() -> list[dict[str, Any]]:
@@ -1601,6 +1712,80 @@ def active_qr_cooldowns() -> list[dict[str, Any]]:
         )
 
     return sorted(active, key=lambda item: int(item["remaining"]))
+
+
+def render_qr_feedback(feedback: Any) -> None:
+    if not isinstance(feedback, dict):
+        return
+    if feedback.get("kind") == "success":
+        st.success(str(feedback.get("message") or "체크인에 성공했어요."))
+    elif feedback.get("kind") == "cooldown":
+        st.warning(str(feedback.get("message") or "QR 쿨타임이 남아 있어요."))
+    else:
+        st.error(str(feedback.get("message") or "QR을 확인하지 못했어요."))
+
+
+def render_qr_cooldowns() -> None:
+    cooldowns = active_qr_cooldowns()
+    if not cooldowns:
+        return
+    rows = "".join(
+        f'<div class="qr-cooldown-item"><b>{h(item["code"])}</b><span>{int(item["remaining"])}초 남음</span></div>'
+        for item in cooldowns
+    )
+    ui(f'<div class="qr-cooldown-list">{rows}</div>')
+
+
+def clear_qr_feedback() -> None:
+    """장소 또는 입력 방법을 바꿀 때 직전 인식 결과만 지웁니다."""
+    st.session_state.qr_feedback = None
+    st.session_state.qr_last_input_sig = ""
+    scanner = st.session_state.get("live_qr_scanner")
+    if scanner is not None and hasattr(scanner, "reset_visibility"):
+        scanner.reset_visibility()
+
+
+def _live_qr_monitor_body(stop: dict[str, Any]) -> None:
+    scanner = st.session_state.get("live_qr_scanner")
+    if scanner is None:
+        st.error("실시간 QR 스캐너를 초기화하지 못했어요.")
+        return
+
+    event = scanner.latest_event()
+    if isinstance(event, dict):
+        event_id = int(event.get("event_id") or 0)
+        if event_id > int(st.session_state.live_qr_consumed_event or 0):
+            st.session_state.live_qr_consumed_event = event_id
+            st.session_state.qr_feedback = register_qr_payload(
+                stop,
+                str(event.get("payload") or ""),
+                image_hash=str(event.get("token") or "live-camera"),
+            )
+
+    render_qr_feedback(st.session_state.get("qr_feedback"))
+
+    status = scanner.status()
+    if status.get("stream_active"):
+        if status.get("visible_payload"):
+            st.caption("✅ QR을 인식했어요. 같은 QR을 다시 시험하려면 화면에서 잠시 치웠다가 다시 보여 주세요.")
+        else:
+            st.caption("카메라가 켜져 있어요. QR을 화면 중앙의 가이드 안에 보여 주세요.")
+    else:
+        st.caption("`카메라 시작`을 누르면 QR을 비추는 즉시 자동으로 인식해요.")
+
+    render_qr_cooldowns()
+    st.caption(f"현재 체크인 {len(st.session_state.checkins)}회 · {st.session_state.points:,}P")
+
+
+if hasattr(st, "fragment"):
+    @st.fragment(run_every=0.5)
+    def render_live_qr_monitor(stop: dict[str, Any]) -> None:
+        _live_qr_monitor_body(stop)
+else:
+    def render_live_qr_monitor(stop: dict[str, Any]) -> None:
+        _live_qr_monitor_body(stop)
+        if st.button("실시간 인식 상태 새로고침", width="stretch", key="refresh_live_qr_status"):
+            st.rerun()
 
 
 # -----------------------------------------------------------------------------
@@ -1818,6 +2003,17 @@ def inject_css() -> None:
 
         /* 카메라 위젯은 높이·overflow를 강제로 제한하지 않는다. */
         [data-testid="stCameraInput"] { border-radius: 1rem; }
+        [data-testid="stCustomComponentV1"] {
+            width: 100%;
+            margin-bottom: .7rem;
+        }
+        [data-testid="stCustomComponentV1"] iframe {
+            width: 100% !important;
+            border: 1px solid var(--line) !important;
+            border-radius: 1.05rem !important;
+            overflow: hidden !important;
+            background: #0d1714;
+        }
 
         .safe-space { height: calc(13rem + env(safe-area-inset-bottom)); }
         .st-key-bottom_nav_shell {
@@ -2034,6 +2230,7 @@ def render_bottom_nav() -> None:
 # -----------------------------------------------------------------------------
 # 홈
 # -----------------------------------------------------------------------------
+
 def page_home(places: pd.DataFrame) -> None:
     ui(
         """
@@ -2067,6 +2264,8 @@ def page_home(places: pd.DataFrame) -> None:
 
     if st.session_state.get("home_region") not in regions:
         st.session_state.home_region = regions[0]
+
+    ai_status = get_ai_status()
 
     with st.container(key="planner"):
         region = st.selectbox("여행 지역", regions, key="home_region")
@@ -2176,11 +2375,32 @@ def page_home(places: pd.DataFrame) -> None:
             key="home_interests",
         )
 
+        selected_ai_label = st.segmented_control(
+            "코스 추천 AI",
+            AI_PROVIDER_OPTIONS,
+            default="Gemini",
+            key="home_ai_provider",
+            width="stretch",
+        ) or "Gemini"
+        ai_provider = AI_PROVIDER_IDS[selected_ai_label]
+        provider_status = ai_status[ai_provider]
+
+        if provider_status.get("configured"):
+            st.caption(
+                f"✨ {selected_ai_label} · {provider_status.get('model', '')}로 코스를 만들어요."
+            )
+        else:
+            key_name = "GEMINI_API_KEY" if ai_provider == "gemini" else "OPENAI_API_KEY"
+            st.warning(
+                f"{selected_ai_label} API 키가 설정되지 않았어요. "
+                f"`.streamlit/secrets.toml`의 `{key_name}`를 확인해 주세요."
+            )
+
         clicked = st.button(
-            "✨ AI 미식 코스 만들기",
+            f"✨ {selected_ai_label}로 미식 코스 만들기",
             type="primary",
             width="stretch",
-            disabled=not has_restaurant,
+            disabled=(not has_restaurant or not provider_status.get("configured")),
             key="create_course",
         )
 
@@ -2195,9 +2415,10 @@ def page_home(places: pd.DataFrame) -> None:
             "start_time": start_time_value.strftime("%H:%M"),
             "origin_address": origin_address.strip(),
             "interests": list(interests),
+            "ai_provider": ai_provider,
         }
 
-        with st.spinner("AI가 취향과 이동 범위를 함께 살펴보고 있어요..."):
+        with st.spinner(f"{selected_ai_label}가 취향과 이동 범위를 함께 살펴보고 있어요..."):
             routes, ai_meta, map_meta = create_recommendations(
                 places,
                 restaurant,
@@ -2214,6 +2435,7 @@ def page_home(places: pd.DataFrame) -> None:
         st.session_state.routes = routes
         st.session_state.route_index = 0
         st.session_state.route_variation = 0
+        mark_generated_course_view()
         st.session_state.route_generation += 1
         st.session_state.ai_meta = ai_meta
         st.session_state.map_meta = map_meta
@@ -2235,29 +2457,33 @@ def page_home(places: pd.DataFrame) -> None:
 # -----------------------------------------------------------------------------
 # 코스
 # -----------------------------------------------------------------------------
+
 def render_recommendation_status() -> None:
     meta = st.session_state.ai_meta
-    if meta.get("source") == "gemini":
+    source = str(meta.get("source") or "")
+    if source in {"gemini", "openai"}:
         latency = float(meta.get("latency_seconds") or 0.0)
+        provider = ai_provider_name(source)
         ui(
             f"""
             <div class="proof">
                 <div class="proof-icon">✦</div>
                 <div>
-                    <b>AI 맞춤 코스가 완성됐어요</b>
+                    <b>{h(provider)} 맞춤 코스가 완성됐어요</b>
                     <span>동행과 관심사를 반영했어요{' · ' + format(latency, '.1f') + '초' if latency else ''}</span>
                 </div>
             </div>
             """
         )
     else:
+        requested = ai_provider_name(meta.get("provider") or st.session_state.preferences.get("ai_provider") or "gemini")
         ui(
-            """
+            f"""
             <div class="proof warn">
                 <div class="proof-icon">!</div>
                 <div>
                     <b>기본 추천 코스를 보여드리고 있어요</b>
-                    <span>아래의 한 개 재시도 버튼으로 AI 추천을 다시 요청할 수 있어요.</span>
+                    <span>{h(requested)} 요청이 실패하면 아래의 한 개 재시도 버튼으로 다시 요청할 수 있어요.</span>
                 </div>
             </div>
             """
@@ -2346,9 +2572,12 @@ def render_stop(stop: dict[str, Any]) -> None:
 
 
 
+
 def regenerate_course(places: pd.DataFrame) -> None:
     st.session_state.route_variation += 1
-    with st.spinner("새로운 AI 코스를 만들고 있어요..."):
+    provider = str(st.session_state.preferences.get("ai_provider") or "gemini")
+    provider_name = ai_provider_name(provider)
+    with st.spinner(f"{provider_name}가 새로운 코스를 만들고 있어요..."):
         routes, ai_meta, map_meta = create_recommendations(
             places,
             st.session_state.selected_restaurant,
@@ -2359,6 +2588,7 @@ def regenerate_course(places: pd.DataFrame) -> None:
     if routes:
         st.session_state.routes = routes
         st.session_state.route_index = 0
+        mark_generated_course_view()
         st.session_state.route_generation += 1
         st.session_state.ai_meta = ai_meta
         st.session_state.map_meta = map_meta
@@ -2370,6 +2600,12 @@ def regenerate_course(places: pd.DataFrame) -> None:
 
 
 def page_course(places: pd.DataFrame) -> None:
+    sync_opened_saved_route()
+
+    saved_route_error = str(st.session_state.pop("saved_route_error", "") or "")
+    if saved_route_error:
+        st.warning(saved_route_error)
+
     if not st.session_state.routes:
         render_empty("🧭", "아직 만든 코스가 없어요", "홈에서 지역과 오늘 방문할 식당을 선택해 주세요.")
         st.button(
@@ -2381,23 +2617,39 @@ def page_course(places: pd.DataFrame) -> None:
         )
         return
 
-    render_recommendation_status()
-    render_section("추천 코스", "AI CURATION", "의도가 다른 세 가지")
+    saved_route_notice = str(st.session_state.pop("saved_route_notice", "") or "")
+    if saved_route_notice:
+        st.toast(saved_route_notice, icon="🗂️")
 
-    route_types = tuple(route["route_type"] for route in st.session_state.routes)
-    selected = st.segmented_control(
-        "코스 유형",
-        route_types,
-        default=route_types[min(st.session_state.route_index, len(route_types) - 1)],
-        key=f"route_type_{st.session_state.route_generation}",
-        label_visibility="collapsed",
-        width="stretch",
-    ) or route_types[0]
-    st.session_state.route_index = route_types.index(selected)
+    render_recommendation_status()
+
+    is_saved_view = st.session_state.course_view_mode == "saved"
+    render_section(
+        "저장한 코스" if is_saved_view else "추천 코스",
+        "MY COURSE" if is_saved_view else "AI CURATION",
+        "MY에서 선택한 일정" if is_saved_view else "의도가 다른 세 가지",
+    )
+
+    if is_saved_view or len(st.session_state.routes) == 1:
+        st.session_state.route_index = 0
+    else:
+        route_types = tuple(route["route_type"] for route in st.session_state.routes)
+        selected = st.segmented_control(
+            "코스 유형",
+            route_types,
+            default=route_types[min(st.session_state.route_index, len(route_types) - 1)],
+            key=f"route_type_{st.session_state.route_generation}",
+            label_visibility="collapsed",
+            width="stretch",
+        ) or route_types[0]
+        st.session_state.route_index = route_types.index(selected)
 
     route = active_route()
     if route is None:
         return
+
+    if is_saved_view:
+        st.caption(f"🗂️ MY에서 불러온 코스 · {route.get('title', '저장 코스')}")
 
     render_route_card(route)
 
@@ -2441,10 +2693,17 @@ def page_course(places: pd.DataFrame) -> None:
             args=(CHECKIN,),
         )
 
+    active_provider = str(
+        st.session_state.preferences.get("ai_provider")
+        or route.get("ai_provider")
+        or st.session_state.ai_meta.get("provider")
+        or "gemini"
+    )
+    provider_name = ai_provider_name(active_provider)
     retry_label = (
-        "🔄 AI 추천 다시 시도"
+        f"🔄 {provider_name} 추천 다시 시도"
         if st.session_state.ai_meta.get("source") == "python"
-        else "🔄 다른 AI 코스 만들기"
+        else f"🔄 다른 {provider_name} 코스 만들기"
     )
     if st.button(retry_label, width="stretch", key="regenerate_ai_course"):
         regenerate_course(places)
@@ -2458,23 +2717,22 @@ def page_course(places: pd.DataFrame) -> None:
                 st.json(attempts)
 
 
+
 # -----------------------------------------------------------------------------
 # 체크인
 # -----------------------------------------------------------------------------
-
-def clear_qr_feedback() -> None:
-    """새 장소·입력 방식·새 QR을 선택할 때 이전 결과 메시지를 즉시 지웁니다."""
-    st.session_state.qr_feedback = None
-    st.session_state.qr_last_input_sig = ""
-
-
-
-
 def page_checkin() -> None:
     route = active_route() or (st.session_state.saved[0] if st.session_state.saved else None)
     if route is None:
         render_empty("📷", "체크인할 코스가 없어요", "먼저 홈에서 코스를 만들어 주세요.")
         return
+
+    route_id_value = str(route.get("id") or "active-route")
+    if st.session_state.live_qr_scanner_route != route_id_value:
+        st.session_state.live_qr_scanner = LiveQRScanner()
+        st.session_state.live_qr_consumed_event = 0
+        st.session_state.live_qr_scanner_route = route_id_value
+        st.session_state.qr_feedback = None
 
     render_section("QR 포인트 체크인", "CHECK-IN", "+100P · QR별 1분 쿨타임")
 
@@ -2500,40 +2758,37 @@ def page_checkin() -> None:
         """
     )
 
-    # 이 위치를 먼저 확보하고, 현재 입력값을 확인한 뒤 최신 메시지만 채웁니다.
-    feedback_slot = st.empty()
-
     st.caption(
         f"같은 QR은 체크인 후 {QR_COOLDOWN_SECONDS}초가 지나야 다시 사용할 수 있어요. "
         "다른 시연용 QR은 바로 사용할 수 있습니다."
     )
 
-    cooldowns = active_qr_cooldowns()
-    if cooldowns:
-        rows = "".join(
-            f'<div class="qr-cooldown-item"><b>{h(item["code"])}</b><span>{int(item["remaining"])}초 남음</span></div>'
-            for item in cooldowns
-        )
-        ui(f'<div class="qr-cooldown-list">{rows}</div>')
-
     method = st.segmented_control(
         "QR 등록 방법",
-        ("QR 이미지 업로드", "카메라 촬영"),
-        default="QR 이미지 업로드",
+        ("실시간 카메라", "QR 이미지 업로드"),
+        default="실시간 카메라",
         key="qr_input_method",
         width="stretch",
         on_change=clear_qr_feedback,
-    ) or "QR 이미지 업로드"
+    ) or "실시간 카메라"
 
-    nonce = int(st.session_state.qr_widget_nonce)
-    image_bytes: bytes | None = None
+    if method == "실시간 카메라":
+        scanner: LiveQRScanner = st.session_state.live_qr_scanner
+        render_live_qr_camera(
+            scanner,
+            key=f"live_qr_camera_{route_id_value}",
+        )
+        render_live_qr_monitor(stop)
 
-    if method == "QR 이미지 업로드":
+    else:
+        nonce = int(st.session_state.qr_widget_nonce)
         uploaded = st.file_uploader(
             "시연용 QR 이미지를 선택해 주세요",
             type=("png", "jpg", "jpeg"),
             key=f"qr_upload_{nonce}",
         )
+
+        image_bytes: bytes | None = None
         if uploaded is not None:
             image_bytes = uploaded.getvalue()
             current_sig = sha1(image_bytes).hexdigest()
@@ -2541,39 +2796,20 @@ def page_checkin() -> None:
                 st.session_state.qr_feedback = None
                 st.session_state.qr_last_input_sig = current_sig
             st.image(image_bytes, caption="선택한 QR 이미지", width="stretch")
-    else:
-        camera_file = st.camera_input(
-            "QR이 화면 가운데 크게 보이도록 촬영해 주세요",
-            key=f"qr_camera_{nonce}",
-            width="stretch",
-        )
-        if camera_file is not None:
-            image_bytes = camera_file.getvalue()
-            current_sig = sha1(image_bytes).hexdigest()
-            if st.session_state.qr_last_input_sig != current_sig:
-                st.session_state.qr_feedback = None
-                st.session_state.qr_last_input_sig = current_sig
 
-    # 새 QR이 선택된 뒤에 메시지를 그리므로 직전 QR의 경고가 화면에 남지 않습니다.
-    feedback = st.session_state.get("qr_feedback")
-    if isinstance(feedback, dict):
-        if feedback.get("kind") == "success":
-            feedback_slot.success(str(feedback.get("message") or "체크인에 성공했어요."))
-        elif feedback.get("kind") == "cooldown":
-            feedback_slot.warning(str(feedback.get("message") or "QR 쿨타임이 남아 있어요."))
-        else:
-            feedback_slot.error(str(feedback.get("message") or "QR을 확인하지 못했어요."))
+        render_qr_feedback(st.session_state.get("qr_feedback"))
+        render_qr_cooldowns()
 
-    if image_bytes is not None:
-        if st.button(
-            "QR 체크인 확인",
-            type="primary",
-            width="stretch",
-            key=f"confirm_qr_{nonce}_{sha1(selected_name.encode('utf-8')).hexdigest()[:8]}",
-        ):
-            st.session_state.qr_feedback = attempt_qr_checkin(stop, image_bytes)
-            st.session_state.qr_last_input_sig = ""
-            st.rerun()
+        if image_bytes is not None:
+            if st.button(
+                "QR 체크인 확인",
+                type="primary",
+                width="stretch",
+                key=f"confirm_qr_{nonce}_{sha1(selected_name.encode('utf-8')).hexdigest()[:8]}",
+            ):
+                st.session_state.qr_feedback = attempt_qr_checkin(stop, image_bytes)
+                st.session_state.qr_last_input_sig = ""
+                st.rerun()
 
     completed = len(st.session_state.checkins)
     ui(
@@ -2581,7 +2817,7 @@ def page_checkin() -> None:
         <div class="simple-card">
             <div class="kicker">포인트 체크인 기록</div>
             <div class="card-title">{completed}회 체크인 · {st.session_state.points:,}P</div>
-            <div class="card-copy">시연용 QR 5개를 번갈아 사용하거나, 같은 QR은 1분 뒤 다시 사용할 수 있어요.</div>
+            <div class="card-copy">실시간 카메라는 QR을 비추는 즉시 인식하며, 이미지 업로드 방식도 시연용으로 계속 사용할 수 있어요.</div>
         </div>
         """
     )
@@ -2590,31 +2826,54 @@ def page_checkin() -> None:
 # -----------------------------------------------------------------------------
 # MY
 # -----------------------------------------------------------------------------
-def open_saved_route(route: dict[str, Any]) -> None:
-    st.session_state.routes = [deepcopy(route)]
+def open_saved_route(route_id_value: str) -> None:
+    """MY에서 누른 코스를 ID로 다시 조회해 그 코스만 정확히 엽니다."""
+    target = find_saved_route(route_id_value)
+    if target is None:
+        st.session_state.saved_route_error = "저장한 코스를 찾지 못했습니다. 목록을 새로 확인해 주세요."
+        return
+
+    clear_course_selector_state()
+    st.session_state.routes = [target]
     st.session_state.route_index = 0
     st.session_state.route_generation += 1
-    st.session_state.selected_restaurant = route.get("restaurant", "")
+    st.session_state.course_view_mode = "saved"
+    st.session_state.opened_saved_route_id = str(target.get("id") or "")
+    st.session_state.saved_route_notice = f"{target.get('title', '저장한 코스')} 코스를 열었어요."
+    st.session_state.saved_route_error = ""
+    st.session_state.selected_restaurant = target.get("restaurant", "")
     st.session_state.preferences = {
-        "region": route.get("region", ""),
-        "companion": route.get("companion", "혼자"),
-        "meal_time": route.get("meal_time", "상관없음"),
-        "course_label": route.get("course_label", "3시간"),
-        "course_minutes": int(route.get("course_minutes", 180)),
-        "start_time": route.get("start_time", "10:00"),
-        "origin_address": str((route.get("origin") or {}).get("address") or ""),
-        "interests": list(route.get("interests", [])),
+        "region": target.get("region", ""),
+        "companion": target.get("companion", "혼자"),
+        "meal_time": target.get("meal_time", "상관없음"),
+        "course_label": target.get("course_label", "3시간"),
+        "course_minutes": int(target.get("course_minutes", 180)),
+        "start_time": target.get("start_time", "10:00"),
+        "origin_address": str((target.get("origin") or {}).get("address") or ""),
+        "interests": list(target.get("interests", [])),
+        "ai_provider": str(target.get("ai_provider") or (target.get("source") if target.get("source") in {"gemini", "openai"} else "gemini")),
     }
-    st.session_state.ai_meta = {"source": route.get("source", "python")}
+    saved_provider = st.session_state.preferences["ai_provider"]
+    st.session_state.ai_meta = {
+        "source": target.get("source", "python"),
+        "provider": saved_provider,
+        "latency_seconds": 0.0,
+        "error": "",
+    }
     st.session_state.map_meta = {}
     clear_route_runtime()
     set_page(COURSE)
 
 
 def delete_saved_route(route_id_value: str) -> None:
+    target_id = str(route_id_value or "")
     st.session_state.saved = [
-        item for item in st.session_state.saved if item["id"] != route_id_value
+        item for item in st.session_state.saved if str(item.get("id") or "") != target_id
     ]
+
+    if str(st.session_state.opened_saved_route_id or "") == target_id:
+        st.session_state.opened_saved_route_id = ""
+        st.session_state.course_view_mode = "generated"
 
 
 def page_my(places: pd.DataFrame) -> None:
@@ -2656,7 +2915,7 @@ def page_my(places: pd.DataFrame) -> None:
                     width="stretch",
                     key=f"open_saved_{route['id']}_{index}",
                     on_click=open_saved_route,
-                    args=(route,),
+                    args=(str(route["id"]),),
                 )
             with right:
                 st.button(
@@ -2686,13 +2945,17 @@ def page_my(places: pd.DataFrame) -> None:
         ui(f'<div class="simple-card">{history}</div>')
 
     render_section("연결 상태", "APP STATUS", "시연 준비 확인")
-    gemini = get_gemini_status()
+    ai_status = get_ai_status()
+    gemini = ai_status["gemini"]
+    openai_status = ai_status["openai"]
     naver = get_naver_status()
     live = st.session_state.naver_live
 
     with st.expander("AI·지도·데이터 상태"):
         st.write("**Gemini 키:** " + ("설정됨" if gemini["configured"] else "키 없음"))
         st.write(f"**Gemini 모델:** `{gemini['model']}`")
+        st.write("**OpenAI 키:** " + ("설정됨" if openai_status["configured"] else "키 없음"))
+        st.write(f"**ChatGPT 모델:** `{openai_status['model']}`")
         st.write("**네이버 지도 키:** " + ("설정됨" if naver["configured"] else "키 없음"))
         st.write(f"**Geocoding 최근 상태:** `{live.get('geocoding', '미확인')}`")
         st.write(f"**자동차 경로 최근 상태:** `{live.get('directions', '미확인')}`")
@@ -2705,7 +2968,12 @@ def page_my(places: pd.DataFrame) -> None:
         )
 
         if st.session_state.ai_meta.get("source"):
-            source_text = "Gemini API" if st.session_state.ai_meta["source"] == "gemini" else "Python 기본 추천"
+            source_value = str(st.session_state.ai_meta.get("source") or "")
+            if source_value in {"gemini", "openai"}:
+                source_text = f"{ai_provider_name(source_value)} API"
+            else:
+                requested = st.session_state.ai_meta.get("provider") or st.session_state.preferences.get("ai_provider")
+                source_text = f"Python 기본 추천 ({ai_provider_name(requested)} 요청 실패)"
             st.write(f"**최근 추천 방식:** `{source_text}`")
 
         if st.session_state.ai_meta.get("error"):

@@ -19,6 +19,9 @@ SECRETS_PATH = BASE_DIR / ".streamlit" / "secrets.toml"
 DEFAULT_MODEL = "gemini-3.6-flash"
 DEFAULT_TIMEOUT_SECONDS = 45
 DEFAULT_RETRY_TIMEOUT_SECONDS = 30
+DEFAULT_OPENAI_MODEL = "gpt-5.6-terra"
+DEFAULT_OPENAI_TIMEOUT_SECONDS = 60
+DEFAULT_OPENAI_REASONING_EFFORT = "low"
 MAX_CANDIDATES = 12
 MAX_AI_PLACES = 4
 
@@ -64,6 +67,10 @@ def _read_streamlit_secrets() -> dict[str, Any]:
             "GEMINI_MODEL",
             "AI_TIMEOUT_SECONDS",
             "AI_RETRY_TIMEOUT_SECONDS",
+            "OPENAI_API_KEY",
+            "OPENAI_MODEL",
+            "OPENAI_TIMEOUT_SECONDS",
+            "OPENAI_REASONING_EFFORT",
         ):
             try:
                 if key in st.secrets:
@@ -128,6 +135,59 @@ def get_gemini_status() -> dict[str, Any]:
         "model": settings["model"],
         "timeout_seconds": settings["timeout_seconds"],
         "retry_timeout_seconds": settings["retry_timeout_seconds"],
+    }
+
+
+def load_openai_settings() -> dict[str, Any]:
+    """OpenAI API 설정을 읽습니다."""
+    values = _read_local_secrets()
+    for key, value in _read_streamlit_secrets().items():
+        values.setdefault(key, value)
+
+    for key in (
+        "OPENAI_API_KEY",
+        "OPENAI_MODEL",
+        "OPENAI_TIMEOUT_SECONDS",
+        "OPENAI_REASONING_EFFORT",
+    ):
+        if key in os.environ:
+            values[key] = os.environ[key]
+
+    reasoning_effort = str(
+        values.get("OPENAI_REASONING_EFFORT")
+        or DEFAULT_OPENAI_REASONING_EFFORT
+    ).lower().strip()
+    if reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
+        reasoning_effort = DEFAULT_OPENAI_REASONING_EFFORT
+
+    return {
+        "api_key": _real_key(values.get("OPENAI_API_KEY")),
+        "model": str(values.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL).strip(),
+        "timeout_seconds": _safe_int(
+            values.get("OPENAI_TIMEOUT_SECONDS"),
+            DEFAULT_OPENAI_TIMEOUT_SECONDS,
+            15,
+            180,
+        ),
+        "reasoning_effort": reasoning_effort,
+    }
+
+
+def get_openai_status() -> dict[str, Any]:
+    settings = load_openai_settings()
+    return {
+        "configured": bool(settings["api_key"]),
+        "model": settings["model"],
+        "timeout_seconds": settings["timeout_seconds"],
+        "reasoning_effort": settings["reasoning_effort"],
+    }
+
+
+def get_ai_status() -> dict[str, Any]:
+    """화면에서 Gemini와 ChatGPT 설정 상태를 한 번에 확인합니다."""
+    return {
+        "gemini": get_gemini_status(),
+        "openai": get_openai_status(),
     }
 
 
@@ -362,6 +422,57 @@ def _call_interaction(*, settings: dict[str, Any], prompt: str, timeout_seconds:
         payload = _json_payload(output_text)
         interaction_id = str(getattr(interaction, "id", "") or "")
         return payload, interaction_id, time.perf_counter() - started
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _call_openai_response(
+    *,
+    settings: dict[str, Any],
+    prompt: str,
+    schema: dict[str, Any],
+    max_output_tokens: int,
+) -> tuple[dict[str, Any], str, float]:
+    """OpenAI Responses API에서 JSON Schema 형태의 코스를 받습니다."""
+    from openai import OpenAI
+
+    started = time.perf_counter()
+    client = OpenAI(
+        api_key=settings["api_key"],
+        timeout=settings["timeout_seconds"],
+        max_retries=0,
+    )
+
+    try:
+        response = client.responses.create(
+            model=settings["model"],
+            instructions=(
+                "너는 전남광주 로컬 미식 코스를 설계하는 큐레이터다. "
+                "사용자가 제공한 후보 ID만 선택하고 지정된 JSON Schema를 정확히 따른다."
+            ),
+            input=prompt,
+            reasoning={"effort": settings["reasoning_effort"]},
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "unnam_local_course_routes",
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+            max_output_tokens=max_output_tokens,
+            store=False,
+        )
+        output_text = str(getattr(response, "output_text", "") or "").strip()
+        if not output_text:
+            raise RuntimeError("ChatGPT 응답이 비어 있습니다.")
+
+        payload = _json_payload(output_text)
+        response_id = str(getattr(response, "id", "") or "")
+        return payload, response_id, time.perf_counter() - started
     finally:
         try:
             client.close()
@@ -756,3 +867,179 @@ def generate_gemini_routes(*, region: str, restaurant: str, course_label: str, c
         "timed_out": False,
         "attempts": attempts,
     }
+
+
+def generate_openai_routes(
+    *,
+    region: str,
+    restaurant: str,
+    course_label: str,
+    course_minutes: int,
+    companion: str,
+    meal_time: str,
+    interests: Sequence[str],
+    candidates: Sequence[dict[str, Any]],
+    place_count: int,
+    variation: int = 0,
+) -> dict[str, Any]:
+    """OpenAI Responses API로 코스 세 개를 생성합니다."""
+    settings = load_openai_settings()
+    prepared, original_by_id = _prepare_candidates(candidates, restaurant)
+
+    if not settings["api_key"]:
+        result = _failure(
+            settings["model"],
+            "OPENAI_API_KEY가 설정되지 않았습니다.",
+            0.0,
+            False,
+            [],
+        )
+        result["provider"] = "openai"
+        return result
+
+    if not prepared:
+        result = _failure(
+            settings["model"],
+            "추천에 사용할 주변 장소가 없습니다.",
+            0.0,
+            False,
+            [],
+        )
+        result["provider"] = "openai"
+        return result
+
+    place_count = max(1, min(int(place_count), len(prepared), MAX_AI_PLACES))
+    schema = _schema(place_count, [str(item["id"]) for item in prepared])
+    prompt = _build_prompt(
+        region=region,
+        restaurant=restaurant,
+        course_label=course_label,
+        course_minutes=course_minutes,
+        companion=companion,
+        meal_time=meal_time,
+        interests=interests,
+        candidates=prepared,
+        place_count=place_count,
+        variation=variation,
+        compact_retry=False,
+    )
+
+    started = time.perf_counter()
+    attempts: list[dict[str, Any]] = []
+    try:
+        payload, response_id, latency = _call_openai_response(
+            settings=settings,
+            prompt=prompt,
+            schema=schema,
+            max_output_tokens=1600,
+        )
+        attempts.append(
+            {
+                "name": "openai_structured",
+                "success": True,
+                "latency_seconds": round(latency, 2),
+                "error": "",
+            }
+        )
+    except Exception as exc:
+        latency = time.perf_counter() - started
+        message = f"{type(exc).__name__}: {exc}"
+        attempts.append(
+            {
+                "name": "openai_structured",
+                "success": False,
+                "latency_seconds": round(latency, 2),
+                "error": message,
+            }
+        )
+        lowered = message.lower()
+        result = _failure(
+            settings["model"],
+            message,
+            latency,
+            "timeout" in lowered or "timed out" in lowered,
+            attempts,
+        )
+        result["provider"] = "openai"
+        return result
+
+    try:
+        routes, repair_count, warnings = _validate_routes(
+            payload,
+            prepared,
+            original_by_id,
+            place_count,
+            companion,
+            course_label,
+        )
+    except Exception as exc:
+        result = _failure(
+            settings["model"],
+            f"응답 검증 실패: {type(exc).__name__}: {exc}",
+            time.perf_counter() - started,
+            False,
+            attempts,
+        )
+        result["provider"] = "openai"
+        return result
+
+    return {
+        "success": True,
+        "routes": routes,
+        "model": settings["model"],
+        "latency_seconds": round(time.perf_counter() - started, 2),
+        "interaction_id": response_id,
+        "repair_count": repair_count,
+        "warnings": warnings,
+        "error": "",
+        "timed_out": False,
+        "attempts": attempts,
+        "provider": "openai",
+    }
+
+
+def generate_ai_routes(
+    *,
+    provider: str = "gemini",
+    region: str,
+    restaurant: str,
+    course_label: str,
+    course_minutes: int,
+    companion: str,
+    meal_time: str,
+    interests: Sequence[str],
+    candidates: Sequence[dict[str, Any]],
+    place_count: int,
+    variation: int = 0,
+) -> dict[str, Any]:
+    """화면에서 선택한 공급자에 맞춰 동일한 코스 생성 인터페이스를 제공합니다."""
+    normalized = str(provider or "gemini").lower().strip()
+    if normalized in {"openai", "gpt", "chatgpt", "챗지피티"}:
+        return generate_openai_routes(
+            region=region,
+            restaurant=restaurant,
+            course_label=course_label,
+            course_minutes=course_minutes,
+            companion=companion,
+            meal_time=meal_time,
+            interests=interests,
+            candidates=candidates,
+            place_count=place_count,
+            variation=variation,
+        )
+
+    result = generate_gemini_routes(
+        region=region,
+        restaurant=restaurant,
+        course_label=course_label,
+        course_minutes=course_minutes,
+        companion=companion,
+        meal_time=meal_time,
+        interests=interests,
+        candidates=candidates,
+        place_count=place_count,
+        variation=variation,
+    )
+    result["provider"] = "gemini"
+    return result
+
