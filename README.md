@@ -4,3 +4,6 @@
 Python 3.14.7
 py -m pip install -r requirements.txt
 py -m streamlit run main.py --server.address 0.0.0.0
+
+
+https://psjproject-4sarmrk6ecb4muabmcpacs.streamlit.app/
