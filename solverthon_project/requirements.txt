@@ -1,15 +1,10 @@
-streamlit>=1.50.0
+streamlit>=1.51.0
 pandas>=2.2.0
 requests>=2.32.0
-
 google-genai>=2.22.0
-groq>=0.31.0
-
-streamlit-webrtc>=0.63.0
-av>=14.0.0
-opencv-python-headless>=4.10.0.84
-
+streamlit-webrtc>=0.77.0,<1.0.0
+av>=15.1.0
+opencv-python-headless>=4.10.0
+numpy>=1.26.0
 Pillow>=10.4.0
-qrcode>=8.0
-
 tomli>=2.0.1; python_version < "3.11"

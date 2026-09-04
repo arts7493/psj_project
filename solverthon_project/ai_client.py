@@ -19,8 +19,8 @@ BASE_DIR = Path(__file__).resolve().parent
 SECRETS_PATH = BASE_DIR / ".streamlit" / "secrets.toml"
 
 DEFAULT_MODEL = "gemini-3.6-flash"
-DEFAULT_TIMEOUT_SECONDS = 45
-DEFAULT_RETRY_TIMEOUT_SECONDS = 30
+DEFAULT_TIMEOUT_SECONDS = 75
+DEFAULT_RETRY_TIMEOUT_SECONDS = 25
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 DEFAULT_GROQ_TIMEOUT_SECONDS = 45
 DEFAULT_GROQ_REASONING_EFFORT = "low"
@@ -126,8 +126,8 @@ def load_gemini_settings() -> dict[str, Any]:
     return {
         "api_key": _real_key(values.get("GEMINI_API_KEY")),
         "model": str(values.get("GEMINI_MODEL") or DEFAULT_MODEL).strip(),
-        "timeout_seconds": _safe_int(values.get("AI_TIMEOUT_SECONDS"), DEFAULT_TIMEOUT_SECONDS, 15, 90),
-        "retry_timeout_seconds": _safe_int(values.get("AI_RETRY_TIMEOUT_SECONDS"), DEFAULT_RETRY_TIMEOUT_SECONDS, 15, 60),
+        "timeout_seconds": _safe_int(values.get("AI_TIMEOUT_SECONDS"), DEFAULT_TIMEOUT_SECONDS, 75, 120),
+        "retry_timeout_seconds": _safe_int(values.get("AI_RETRY_TIMEOUT_SECONDS"), DEFAULT_RETRY_TIMEOUT_SECONDS, 15, 45),
     }
 
 
@@ -852,7 +852,16 @@ def generate_gemini_routes(*, region: str, restaurant: str, course_label: str, c
             errors.append(f"{spec['name']}: {message}")
             attempts.append({"name": spec["name"], "success": False, "latency_seconds": round(latency, 2), "error": message})
             lowered = message.lower()
-            if "429" in lowered or "quota" in lowered or "rate limit" in lowered or "too_many_requests" in lowered:
+            # 쿼터 초과는 즉시 다른 AI로 전환합니다.
+            # 클라이언트 타임아웃은 이미 75초를 기다린 뒤이므로 같은 Gemini 요청을 다시 반복하지 않습니다.
+            if (
+                "429" in lowered
+                or "quota" in lowered
+                or "rate limit" in lowered
+                or "too_many_requests" in lowered
+                or "timeout" in lowered
+                or "timed out" in lowered
+            ):
                 break
 
     total_latency = time.perf_counter() - total_started

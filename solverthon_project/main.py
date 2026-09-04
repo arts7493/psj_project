@@ -365,6 +365,7 @@ def init_state() -> None:
         "qr_last_input_sig": "",
         "live_qr_consumed_event": 0,
         "live_qr_scanner_route": "",
+        "live_qr_camera_nonce": 0,
         "course_view_mode": "generated",
         "opened_saved_route_id": "",
         "saved_route_notice": "",
@@ -1763,13 +1764,29 @@ def clear_qr_feedback() -> None:
         scanner.reset_visibility()
 
 
+def restart_live_qr_camera() -> None:
+    """기본 카메라 연결을 새로 만들고 체크인 페이지를 유지합니다."""
+    st.session_state.page = CHECKIN
+    st.session_state.live_qr_camera_nonce = int(
+        st.session_state.get("live_qr_camera_nonce", 0)
+    ) + 1
+    st.session_state.live_qr_scanner = LiveQRScanner()
+    st.session_state.live_qr_consumed_event = 0
+    st.session_state.qr_feedback = None
+    st.session_state.qr_last_input_sig = ""
+
+
 def _live_qr_monitor_body(stop: dict[str, Any]) -> None:
     scanner = st.session_state.get("live_qr_scanner")
     if scanner is None:
         st.error("실시간 QR 스캐너를 초기화하지 못했어요.")
         return
 
-    event = scanner.latest_event()
+    if hasattr(scanner, "pop_event"):
+        event = scanner.pop_event()
+    else:
+        event = scanner.latest_event()
+
     if isinstance(event, dict):
         event_id = int(event.get("event_id") or 0)
         if event_id > int(st.session_state.live_qr_consumed_event or 0):
@@ -1785,18 +1802,24 @@ def _live_qr_monitor_body(stop: dict[str, Any]) -> None:
     status = scanner.status()
     if status.get("stream_active"):
         if status.get("visible_payload"):
-            st.caption("✅ QR을 인식했어요. 같은 QR을 다시 시험하려면 화면에서 잠시 치웠다가 다시 보여 주세요.")
+            st.caption(
+                "✅ QR을 인식했어요. 같은 QR을 다시 시험하려면 "
+                "화면에서 잠시 치웠다가 다시 보여 주세요."
+            )
         else:
-            st.caption("카메라가 켜져 있어요. QR을 화면 중앙의 가이드 안에 보여 주세요.")
+            st.caption("카메라가 켜져 있어요. QR을 중앙 가이드 안에 크게 보여 주세요.")
     else:
-        st.caption("`카메라 시작`을 누르면 QR을 비추는 즉시 자동으로 인식해요.")
+        st.caption(
+            "기본 카메라를 자동으로 연결하고 있어요. "
+            "처음 한 번만 브라우저의 카메라 권한을 허용해 주세요."
+        )
 
     render_qr_cooldowns()
     st.caption(f"현재 체크인 {len(st.session_state.checkins)}회 · {st.session_state.points:,}P")
 
 
 if hasattr(st, "fragment"):
-    @st.fragment(run_every=0.5)
+    @st.fragment(run_every=0.35)
     def render_live_qr_monitor(stop: dict[str, Any]) -> None:
         _live_qr_monitor_body(stop)
 else:
@@ -2779,6 +2802,9 @@ def page_checkin() -> None:
         st.session_state.live_qr_scanner = LiveQRScanner()
         st.session_state.live_qr_consumed_event = 0
         st.session_state.live_qr_scanner_route = route_id_value
+        st.session_state.live_qr_camera_nonce = int(
+            st.session_state.get("live_qr_camera_nonce", 0)
+        ) + 1
         st.session_state.qr_feedback = None
 
     render_section("QR 포인트 체크인", "CHECK-IN", "+100P · QR별 1분 쿨타임")
@@ -2821,10 +2847,28 @@ def page_checkin() -> None:
 
     if method == "실시간 카메라":
         scanner: LiveQRScanner = st.session_state.live_qr_scanner
-        render_live_qr_camera(
+        camera_nonce = int(st.session_state.get("live_qr_camera_nonce", 0))
+        camera_context = render_live_qr_camera(
             scanner,
-            key=f"live_qr_camera_{route_id_value}",
+            key=f"live_qr_camera_{route_id_value}_{camera_nonce}",
         )
+
+        playing = bool(
+            camera_context is not None
+            and getattr(getattr(camera_context, "state", None), "playing", False)
+        )
+        if not playing:
+            st.caption(
+                "카메라 권한을 허용하면 기본 카메라가 자동으로 열립니다. "
+                "연결이 멈춘 경우 아래 버튼만 한 번 눌러 주세요."
+            )
+            st.button(
+                "↻ 카메라 다시 연결",
+                width="stretch",
+                key=f"restart_live_qr_{route_id_value}_{camera_nonce}",
+                on_click=restart_live_qr_camera,
+            )
+
         render_live_qr_monitor(stop)
 
     else:
